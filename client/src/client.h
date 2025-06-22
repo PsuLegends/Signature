@@ -26,6 +26,7 @@
 #include <cryptopp/osrng.h>
 #include <iomanip>
 #include "protocol.h"
+#include "rsa_crypto.h"
 class client {
     private:
         show_error debugger;

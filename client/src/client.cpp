@@ -51,7 +51,7 @@ void client::work(UI &intf)
         {
             send_data("OP", id, 0, std::to_string(operation));
             std::string file_path;
-            std::cout << "[INPUT] Введите путь к файлу данных: "<<std::endl;
+            std::cout << "[INPUT] Введите путь к файлу данных: " << std::endl;
             std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
             std::getline(std::cin, file_path);
             std::cout << "[INFO] [" << method_name << "] Генерация хеша по файлу: " << file_path << std::endl;
@@ -59,16 +59,52 @@ void client::work(UI &intf)
             std::cout << "[INFO] [" << method_name << "] Отправка хеша файла для подписи: " << hash << std::endl;
             send_data("SND_FILE_256", id, 1, hash);
             std::cout << "[INFO] [" << method_name << "] Хеш файла отправлен на подпись: " << hash << std::endl;
-            std::string sig=recv_data("Ошибка при приеме подписи");
-            std::cout<<"Подпись: "<<sig<<std::endl;
+            std::string sig = recv_data("Ошибка при приеме подписи");
+            std::cout << "Подпись: " << sig << std::endl;
+            file_path.erase(file_path.find_last_of('.'));
+            saveKeyToFile("signature_" + file_path + ".bin", BigInt::fromHexString(sig));
             break;
         }
         case 22:
         {
             send_data("OP", id, 0, std::to_string(operation));
-            std::string sig = recv_data("Ошибка при приеме подписи");
+            std::cout << "[INPUT] Ожидание ключей" << std::endl;
+
             std::string open_key = recv_data("Ошибка при приеме открытого ключа");
-            std::cout << "[INFO] [" << method_name << "] Начало проверки подписи: " << sig << std::endl;
+            std::string eksp = recv_data("Ошибка при приеме экспоненты");
+
+            std::cout << "Открытый ключ: " << open_key << std::endl;
+            std::cout << "Экспонента: " << eksp << std::endl;
+
+            std::string sig_path, file_path;
+            std::cout << "[INPUT] Введите путь к файлу с подписью: ";
+            std::cin >> sig_path;
+
+            std::cout << "[INPUT] Введите путь к файлу с данными: ";
+            std::cin >> file_path;
+
+            std::cout << "[INFO] [" << method_name << "] Начало проверки подписи" << std::endl;
+
+            BigInt sig, e, n;
+            e = BigInt::fromHexString(eksp);
+            n = BigInt::fromHexString(open_key);
+            sig = loadKeyFromFile(sig_path);
+
+            BigInt verifiedHash = rsa_mod_exp(sig, e, n);
+            std::cout << "\n🔍 Verified hash: ";
+            verifiedHash.printHex();
+
+            std::string hash_file = hash_gen_file(file_path);
+            std::cout << "\n🎯 Original hash (as BigInt): " << hash_file << std::endl;
+
+            if (verifiedHash.toHexString() == hash_file)
+            {
+                std::cout << "\n✅ The signature is confirmed: The hashes match!\n";
+            }
+            else
+            {
+                std::cout << "\n❌ The signature is not confirmed: The hashes do not match!\n";
+            }
             break;
         }
         default:

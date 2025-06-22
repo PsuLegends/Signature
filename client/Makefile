@@ -3,7 +3,7 @@
 # Компилятор и флаги
 CXX = g++
 CXXFLAGS = -Wall -fPIC 
-LDLIBS = -lboost_program_options -lcrypto++ -lboost_filesystem
+LDLIBS = -lboost_program_options -lcrypto++ -lboost_filesystem -lcrypto
 
 # Параметры путей
 SRCDIR ?= src

@@ -211,7 +211,6 @@ void communicator::work()
     }
 }
 
-
 void communicator::handle_client(int client_socket, sockaddr_in clientAddr)
 {
     const std::string method_name = "handle_client";
@@ -258,63 +257,86 @@ void communicator::handle_client(int client_socket, sockaddr_in clientAddr)
             std::cout << "[INFO] [" << method_name << "] Успешная аутентификация клиента: " << cl_id << std::endl;
             log.write_log(log_location, method_name + " | Аутентификация пройдена | ID: " + cl_id + " | IP: " + client_ip);
         }
-        std::string sig_op = recv_data(client_socket, "Ошибка при приеме типа операции с подписью");
-        if (sig_op == "11")
+        while (true)
         {
-            std::cout << "[INFO] [" << method_name << "] Начала процесса подписи файла" << std::endl;
-            // --- ВАШ СУЩЕСТВУЮЩИЙ КОД ---
-            std::string hash_file = recv_data(client_socket, "Ошибка при приеме хеша файла для подписи");
-
-            // Генерируем новую пару ключей для этой конкретной операции
-            RSAKeyPair keyPair(keyLength);
-
-            // Сохраняем ключи. Имена файлов уникальны для клиента (cl_id)
-            saveKeyToFile("private_" + cl_id + ".key", keyPair.d);
-            saveKeyToFile("public_n_" + cl_id + ".key", keyPair.n);
-            saveKeyToFile("public_e_" + cl_id + ".key", keyPair.e);
-
-            BigInt d, n, e;
-            try
+            std::string sig_op = recv_data(client_socket, "Ошибка при приеме типа операции с подписью");
+            if (sig_op == "11")
             {
-                // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
-                d = loadKeyFromFile("private_" + cl_id + ".key");
-                n = loadKeyFromFile("public_n_" + cl_id + ".key");
-                e = loadKeyFromFile("public_e_" + cl_id + ".key");
-                std::cout << "📥 Keys loaded from files.\n";
+                std::cout << "[INFO] [" << method_name << "] Начала процесса подписи файла" << std::endl;
+                std::string hash_file = recv_data(client_socket, "Ошибка при приеме хеша файла для подписи");
+
+                // Генерируем новую пару ключей для этой конкретной операции
+                RSAKeyPair keyPair(keyLength);
+
+                // Сохраняем ключи. Имена файлов уникальны для клиента (cl_id)
+                saveKeyToFile("private_" + cl_id + ".key", keyPair.d);
+                saveKeyToFile("public_n_" + cl_id + ".key", keyPair.n);
+                saveKeyToFile("public_e_" + cl_id + ".key", keyPair.e);
+
+                BigInt d, n, e;
+                try
+                {
+                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
+                    d = loadKeyFromFile("private_" + cl_id + ".key");
+                    n = loadKeyFromFile("public_n_" + cl_id + ".key");
+                    e = loadKeyFromFile("public_e_" + cl_id + ".key");
+                    std::cout << "Keys loaded from files.\n";
+                }
+                catch (const std::exception &ex)
+                {
+                    std::cerr << "Failed to load keys: " << ex.what() << std::endl;
+                    // В серверном приложении здесь может потребоваться более сложная обработка ошибок
+                    return;
+                }
+
+                std::cout << "Received hash (HEX): " << hash_file << std::endl;
+
+                // Конвертируем полученный HEX-хеш в вектор байт
+                std::vector<unsigned char> byteVector = hexStringToBytes(hash_file);
+
+                // *ИСПРАВЛЕНИЕ:* Используем вектор байт `byteVector` для создания BigInt
+                BigInt hashInt = fromBytes(byteVector);
+                hashInt.printHex("   Hash as BigInt: ");
+
+                // --- НАЧАЛО ДОБАВЛЕННОГО ФРАГМЕНТА ---
+
+                // 1. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
+                std::cout << "Generating signature..." << std::endl;
+                BigInt signature = rsa_mod_exp(hashInt, d, n);
+                signature.printHex("   Generated Signature (BigInt): ");
+
+                // 2. Конвертируем объект подписи BigInt в HEX-строку для отправки клиенту
+                std::string signature_hex = signature.toHexString();
+                std::cout << "   Signature to send (HEX): " << signature_hex << std::endl;
+                // 3. Отправляем сгенерированную подпись обратно клиенту
+                // (Предполагается, что у вас есть функция send_data, аналогичная recv_data)
+                send_data(client_socket, "SIG_SEND", cl_id, 1, signature_hex);
+                std::cout << "Signature successfully sent to client " << cl_id << std::endl;
+                continue;
             }
-            catch (const std::exception &ex)
+            if (sig_op == "22")
             {
-                std::cerr << "❌ Failed to load keys: " << ex.what() << std::endl;
-                // В серверном приложении здесь может потребоваться более сложная обработка ошибок
-                return;
+                std::cout << "[INFO] [" << method_name << "] Начала процесса отправки открытого ключа подписи для ее проверки" << std::endl;
+                BigInt d, n, e;
+                try
+                {
+                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
+                    d = loadKeyFromFile("private_" + cl_id + ".key");
+                    n = loadKeyFromFile("public_n_" + cl_id + ".key");
+                    e = loadKeyFromFile("public_e_" + cl_id + ".key");
+                    std::cout << "Keys loaded from files.\n";
+                }
+                catch (const std::exception &ex)
+                {
+                    std::cerr << "Failed to load keys: " << ex.what() << std::endl;
+                    // В серверном приложении здесь может потребоваться более сложная обработка ошибок
+                    return;
+                }
+                send_data(client_socket, "OP_KEY", cl_id, 1, n.toHexString());
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                send_data(client_socket, "EKSP", cl_id, 1, e.toHexString());
+                continue;
             }
-
-            std::cout << "📄 Received hash (HEX): " << hash_file << std::endl;
-
-            // Конвертируем полученный HEX-хеш в вектор байт
-            std::vector<unsigned char> byteVector = hexStringToBytes(hash_file);
-
-            // *ИСПРАВЛЕНИЕ:* Используем вектор байт `byteVector` для создания BigInt
-            BigInt hashInt = fromBytes(byteVector);
-            hashInt.printHex("   Hash as BigInt: ");
-
-            // --- НАЧАЛО ДОБАВЛЕННОГО ФРАГМЕНТА ---
-
-            // 1. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
-            std::cout << "✍️  Generating signature..." << std::endl;
-            BigInt signature = rsa_mod_exp(hashInt, d, n);
-            signature.printHex("   Generated Signature (BigInt): ");
-
-            // 2. Конвертируем объект подписи BigInt в HEX-строку для отправки клиенту
-            std::string signature_hex = signature.toHexString();
-            std::cout << "   Signature to send (HEX): " << signature_hex << std::endl;
-            // 3. Отправляем сгенерированную подпись обратно клиенту
-            // (Предполагается, что у вас есть функция send_data, аналогичная recv_data)
-            send_data(client_socket, "SIG_SEND", cl_id, 1, signature_hex);
-            std::cout << "✅ Signature successfully sent to client " << cl_id << std::endl;
-        }
-        if (sig_op == "22")
-        {
         }
         active_clients.fetch_sub(1);
     }
