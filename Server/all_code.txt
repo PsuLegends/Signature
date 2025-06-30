@@ -1,0 +1,2171 @@
+================================================================================
+// Файл: main.cpp
+================================================================================
+
+#include "ui.h"
+#include "communicator.h"
+#include "logger.h"
+#include "error.h"
+int main(int argc, char* argv[])
+{
+    UI interface (argc,argv);
+    communicator server (interface.get_port(),interface.get_log_loc());
+    server.work();
+    return 0;
+}
+
+
+================================================================================
+// Файл: Protocol_utils/protocol_utils.cpp
+================================================================================
+
+#include "protocol_utils.h"
+
+// Системные заголовочные файлы для работы с сокетами
+#include <sys/socket.h>
+#include <unistd.h> // Для close()
+#include <vector>
+#include <iostream> // Для вывода ошибок
+
+namespace ProtocolUtils
+{
+
+    /**
+     * Реализация надежной отправки данных.
+     */
+    int send_packet(int socket, const std::string &data)
+    {
+        if (socket < 0)
+        {
+            std::cerr << "[ERROR] [ProtocolUtils::send_packet] Invalid socket descriptor." << std::endl;
+            return -1;
+        }
+
+        const char *buffer = data.data();
+        size_t total_to_send = data.size();
+        size_t total_sent = 0;
+
+        // Цикл будет продолжаться, пока все байты не будут отправлены
+        while (total_sent < total_to_send)
+        {
+            // Пытаемся отправить оставшиеся данные.
+            // MSG_NOSIGNAL предотвращает генерацию сигнала SIGPIPE, если клиент
+            // внезапно закрыл соединение. Вместо этого send() вернет ошибку.
+            ssize_t bytes_sent_this_call = send(socket, buffer + total_sent, total_to_send - total_sent, MSG_NOSIGNAL);
+
+            if (bytes_sent_this_call < 0)
+            {
+                // Произошла ошибка сокета
+                perror("[ERROR] [ProtocolUtils::send_packet] send() failed");
+                return -1;
+            }
+
+            if (bytes_sent_this_call == 0)
+            {
+                // Это редкая ситуация, но может означать, что соединение закрыто.
+                std::cerr << "[ERROR] [ProtocolUtils::send_packet] Connection closed by peer." << std::endl;
+                return -1;
+            }
+
+            // Увеличиваем счетчик отправленных байт
+            total_sent += bytes_sent_this_call;
+        }
+
+        return 0; // Все данные успешно отправлены
+    }
+
+    /**
+     * Реализация приема данных.
+     */
+    std::string receive_packet(int socket, size_t buffer_size)
+    {
+        if (socket < 0)
+        {
+            std::cerr << "[ERROR] [ProtocolUtils::receive_packet] Invalid socket descriptor." << std::endl;
+            return "";
+        }
+
+        // Создаем буфер для приема данных
+        std::vector<char> buffer(buffer_size);
+
+        // Пытаемся прочитать данные из сокета
+        ssize_t bytes_received = recv(socket, buffer.data(), buffer.size(), 0);
+
+        if (bytes_received < 0)
+        {
+            // Произошла ошибка сокета
+            perror("[ERROR] [ProtocolUtils::receive_packet] recv() failed");
+            return ""; // Возвращаем пустую строку при ошибке
+        }
+
+        if (bytes_received == 0)
+        {
+            // Это штатная ситуация, означающая, что клиент закрыл соединение
+            // с его стороны (послал FIN).
+            std::cout << "[INFO] [ProtocolUtils::receive_packet] Connection closed by peer (socket " << socket << ")." << std::endl;
+            return ""; // Возвращаем пустую строку, сигнализируя о закрытии
+        }
+
+        // Возвращаем строку, созданную из полученных данных
+        return std::string(buffer.data(), bytes_received);
+    }
+    int send_formatted_message(int socket, const std::string &header, const std::string &client_id, int msg_id, const std::string &message)
+    {
+        // 1. Формируем основной пакет
+        std::string data_packet = MessageProtocol::build(header, client_id, msg_id, message);
+
+        // 2. Формируем пакет с его длиной
+        std::string length_str = std::to_string(data_packet.size());
+        std::string length_packet = MessageProtocol::build("LENGTH", "server", -1, length_str);
+
+        // 3. Отправляем пакет с длиной
+        if (send_packet(socket, length_packet) != 0)
+        {
+            std::cerr << "[ERROR] [send_formatted_message] Failed to send LENGTH packet." << std::endl;
+            return -1;
+        }
+
+        // Небольшая технологическая пауза. В идеальном мире она не нужна,
+        // но на практике может помочь клиенту обработать пакеты по очереди.
+        // Если уберете, тщательно тестируйте.
+        //std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        // 4. Отправляем основной пакет
+        if (send_packet(socket, data_packet) != 0)
+        {
+            std::cerr << "[ERROR] [send_formatted_message] Failed to send DATA packet." << std::endl;
+            return -1;
+        }
+
+        return 0;
+    }
+
+    std::string receive_formatted_message(int socket, size_t buffer_size)
+    {
+        // 1. Принимаем первый пакет (ожидаем, что это пакет с длиной)
+        std::string length_packet_raw = receive_packet(socket, buffer_size);
+        if (length_packet_raw.empty())
+            return "";
+
+        // 2. Парсим его, чтобы узнать длину следующего пакета
+        MessageProtocol::ParsedMessage parsed_length_msg;
+        try
+        {
+            parsed_length_msg = MessageProtocol::parse(length_packet_raw);
+        }
+        catch (...)
+        { /* ошибка парсинга */
+            return "";
+        }
+
+        if (parsed_length_msg.header != "LENGTH")
+        {
+            // Нарушение протокола
+            std::cerr << "[ERROR] [receive_formatted_message] Expected LENGTH packet, but got " << parsed_length_msg.header << std::endl;
+            return "";
+        }
+
+        // !!! Этот простой recv не гарантирует получение всех данных, если они большие.
+        // Здесь нужна более сложная логика чтения ровно `payload_size` байт.
+        // Пока для простоты оставляем так.
+        // 3. Принимаем второй, основной пакет
+        std::string data_packet_raw = receive_packet(socket, buffer_size);
+        if (data_packet_raw.empty())
+            return "";
+
+        // 4. Парсим его и возвращаем полезную нагрузку
+        MessageProtocol::ParsedMessage parsed_data_msg;
+        try
+        {
+            parsed_data_msg = MessageProtocol::parse(data_packet_raw);
+        }
+        catch (...)
+        { /* ошибка парсинга */
+            return "";
+        }
+
+        return parsed_data_msg.message;
+    }
+} // namespace ProtocolUtils
+
+================================================================================
+// Файл: Protocol_utils/protocol_utils.h
+================================================================================
+
+#pragma once
+
+#include <string>
+#include "../Protocol/protocol.h" // Нужен для MessageProtocol::build/parse
+
+/**
+ * @brief Пространство имен для утилит, связанных с низкоуровневой передачей данных по протоколу.
+ */
+namespace ProtocolUtils {
+
+    /**
+     * @brief Надежно отправляет пакет данных в сокет.
+     * Гарантирует, что все данные будут отправлены, даже если системный вызов
+     * send() отправит их по частям.
+     * @param socket Дескриптор сокета клиента.
+     * @param data Данные для отправки.
+     * @return 0 в случае успеха, -1 в случае ошибки (например, разрыв соединения).
+     */
+    int send_packet(int socket, const std::string& data);
+
+    /**
+     * @brief Принимает пакет данных из сокета.
+     * Читает данные из сокета до тех пор, пока они есть, но не более чем buffer_size.
+     * @param socket Дескриптор сокета клиента.
+     * @param buffer_size Максимальный размер данных для чтения за один вызов.
+     * @return Полученные данные в виде строки. Если произошла ошибка или
+     *         соединение закрыто, возвращает пустую строку.
+     */
+    std::string receive_packet(int socket, size_t buffer_size);
+    /**
+     * @brief Высокоуровневая функция для отправки сообщения по протоколу LENGTH + DATA.
+     * Сначала формирует и отправляет пакет с длиной, а затем - основной пакет с данными.
+     * @return 0 в случае успеха, -1 в случае ошибки.
+     */
+    int send_formatted_message(int socket, const std::string& header, const std::string& client_id, int msg_id, const std::string& message);
+
+    /**
+     * @brief Высокоуровневая функция для приема сообщения по протоколу LENGTH + DATA.
+     * Сначала принимает и парсит пакет с длиной, а затем принимает основной пакет.
+     * @return Распарсированная полезная нагрузка (message). Пустая строка при ошибке.
+     */
+    std::string receive_formatted_message(int socket, size_t buffer_size);
+
+} // namespace ProtocolUtils
+
+================================================================================
+// Файл: Signing/signing_service.cpp
+================================================================================
+
+#include "signing_service.h"
+
+// Подключаем наши утилитарные функции для RSA
+// Путь нужно будет скорректировать под вашу структуру.
+#include "../Rsa/rsa_crypto.h"
+
+#include <iostream> // для вывода в консоль
+#include <vector>
+
+/**
+ * @brief Конструктор сервиса подписи. Сразу же пытается загрузить ключи.
+ */
+SigningService::SigningService(const std::string& private_key_path,
+                               const std::string& public_key_n_path,
+                               const std::string& public_key_e_path) 
+{
+    // Обертываем загрузку ключей в блок try-catch,
+    // чтобы обработать ошибки и кинуть наше кастомное исключение.
+    try {
+        std::cout << "[INFO] [SigningService] Загрузка ключей..." << std::endl;
+        
+        // Используем вспомогательную функцию из RSA-модуля для загрузки.
+        // Предполагается, что она кидает std::exception в случае ошибки.
+        d_key = loadKeyFromFile(private_key_path);
+        n_key = loadKeyFromFile(public_key_n_path);
+        e_key = loadKeyFromFile(public_key_e_path);
+
+        keys_are_loaded = true;
+        std::cout << "[INFO] [SigningService] Ключи успешно загружены." << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "[CRITICAL] [SigningService] Не удалось загрузить ключи: " << e.what() << std::endl;
+        // Кидаем наше собственное, более специфичное исключение, которое
+        // может быть поймано на более высоком уровне (например, в классе Server).
+        throw SigningServiceError("Ошибка при инициализации сервиса подписи: " + std::string(e.what()));
+    }
+}
+
+/**
+ * @brief Подписывает предоставленный хеш.
+ */
+std::string SigningService::signHash(const std::string& hex_hash) const {
+    if (!keys_are_loaded) {
+        throw SigningServiceError("Невозможно подписать хеш: ключи не были загружены.");
+    }
+
+    std::cout << "[INFO] [SigningService] Начало процесса подписи для хеша: " << hex_hash << std::endl;
+
+    // 1. Конвертируем полученный HEX-хеш в вектор байт
+    std::vector<unsigned char> byte_vector = hexStringToBytes(hex_hash);
+
+    // 2. Преобразуем вектор байт в объект BigInt
+    BigInt hash_as_bigint = fromBytes(byte_vector);
+
+    // 3. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
+    BigInt signature = rsa_mod_exp(hash_as_bigint, d_key, n_key);
+    
+    // 4. Конвертируем объект подписи BigInt в HEX-строку для возврата
+    std::string signature_hex = signature.toHexString();
+    
+    std::cout << "[INFO] [SigningService] Сгенерирована подпись: " << signature_hex << std::endl;
+
+    return signature_hex;
+}
+
+/**
+ * @brief Возвращает компонент N публичного ключа.
+ */
+std::string SigningService::getPublicKeyN_Hex() const {
+    if (!keys_are_loaded) {
+        throw SigningServiceError("Невозможно получить ключ N: ключи не были загружены.");
+    }
+    return n_key.toHexString();
+}
+
+/**
+ * @brief Возвращает компонент E публичного ключа.
+ */
+std::string SigningService::getPublicKeyE_Hex() const {
+    if (!keys_are_loaded) {
+        throw SigningServiceError("Невозможно получить ключ E: ключи не были загружены.");
+    }
+    return e_key.toHexString();
+}
+
+================================================================================
+// Файл: Signing/signing_service.h
+================================================================================
+
+#pragma once
+
+#include <string>
+#include <stdexcept>
+
+// Подключаем наш модуль для работы с RSA.
+// Путь нужно будет скорректировать под вашу структуру.
+#include "../Rsa/rsa_crypto.h" 
+
+// Определяем кастомное исключение для ошибок сервиса подписи
+class SigningServiceError : public std::runtime_error {
+public:
+    explicit SigningServiceError(const std::string& message) : std::runtime_error(message) {}
+};
+
+class SigningService {
+public:
+    /**
+     * @brief Конструктор сервиса подписи.
+     * @param private_key_path Путь к файлу с приватным ключом (d).
+     * @param public_key_n_path Путь к файлу с компонентом N публичного ключа.
+     * @param public_key_e_path Путь к файлу с компонентом E публичного ключа.
+     */
+    SigningService(const std::string& private_key_path, 
+                   const std::string& public_key_n_path, 
+                   const std::string& public_key_e_path);
+
+    /**
+     * @brief Подписывает предоставленный хеш.
+     * @param hex_hash Хеш данных, представленный в виде HEX-строки.
+     * @return Электронная подпись в виде HEX-строки.
+     * @throw SigningServiceError если ключи не были загружены.
+     */
+    std::string signHash(const std::string& hex_hash) const;
+
+    /**
+     * @brief Возвращает компонент N публичного ключа.
+     * @return Компонент N в виде HEX-строки.
+     * @throw SigningServiceError если ключи не были загружены.
+     */
+    std::string getPublicKeyN_Hex() const;
+
+    /**
+     * @brief Возвращает компонент E публичного ключа.
+     * @return Компонент E в виде HEX-строки.
+     * @throw SigningServiceError если ключи не были загружены.
+     */
+    std::string getPublicKeyE_Hex() const;
+
+private:
+    /**
+     * @brief Внутренняя функция для загрузки всех ключей с диска.
+     * @throw SigningServiceError если какой-либо из файлов ключей не может быть загружен.
+     */
+    void loadKeys();
+
+    // Хранилища для ключей
+    BigInt d_key; // Приватный ключ
+    BigInt n_key; // Модуль (часть публичного ключа)
+    BigInt e_key; // Экспонента (часть публичного ключа)
+    
+    // Флаг, показывающий, были ли ключи успешно загружены
+    bool keys_are_loaded = false;
+};
+
+================================================================================
+// Файл: Base/database.cpp
+================================================================================
+
+#include "base.h"
+
+base::base() {
+    // Попытка подключения к базе данных "client_base.db" при создании объекта.
+    if (!connectToDatabase("client_base.db")) {
+        // Если подключение не удалось, выводим критическую ошибку в журнал
+        qCritical() << "Не удалось подключиться к базе данных.";
+    }
+}
+
+// Подключение к базе данных
+bool base::connectToDatabase(const std::string& dbName) {
+    // Проверяем существование файла базы данных
+    QFileInfo dbFile(QString::fromStdString(dbName));
+    if (!dbFile.exists() || !dbFile.isFile()) {
+        qCritical() << "Ошибка: файл базы данных не найден:" << QString::fromStdString(dbName);
+        exit(1);
+        return false;
+    }
+
+    // Устанавливаем имя базы данных для объекта db
+    db.setDatabaseName(QString::fromStdString(dbName));
+    
+    // Пытаемся открыть соединение с базой данных
+    if (!db.open()) {
+        // Если не удалось подключиться, выводим ошибку и возвращаем false
+        printQueryError(query, "CONNECT");
+        return false;
+    }
+    
+    // Если подключение успешно, выводим сообщение
+    qDebug() << "Подключение к базе данных успешно.";
+    return true;
+}
+
+
+// Функция для вставки нового пользователя в таблицу
+bool base::insertUser(const std::string& username, const std::string& password, const std::string& ip) {
+    // Подготавливаем SQL-запрос для вставки данных пользователя в таблицу "users"
+    query.prepare("INSERT INTO users (username, password, ip) VALUES (:username, :password, :ip)");
+    
+    // Привязываем значения параметров к запросу
+    query.bindValue(":username", QString::fromStdString(username));
+    query.bindValue(":password", QString::fromStdString(password));
+    query.bindValue(":ip", QString::fromStdString(ip));
+
+    // Выполняем запрос на выполнение
+    if (!query.exec()) {
+        // Если запрос не выполнен, выводим ошибку и возвращаем false
+        printQueryError(query, "INSERT");
+        return false;
+    }
+    
+    // Если запрос успешен, выводим сообщение о добавлении пользователя
+    qDebug() << "Пользователь успешно добавлен.";
+    return true;
+}
+// Функция для выбора пользователя по имени
+bool base::selectUserByName(std::string name) {
+    // Подготавливаем SQL-запрос для выбора пользователя по имени
+    query.prepare("SELECT * FROM users WHERE username = :name");
+    query.bindValue(":name", QString::fromStdString(name));
+
+    // Выполняем запрос
+    if (!query.exec()) {
+        // Если запрос не выполнен, выводим ошибку и возвращаем false
+        printQueryError(query, "SELECT");
+        return false;
+    }
+
+    // Если пользователь найден, извлекаем его данные
+    if (query.next()) {
+        int userId = query.value(0).toInt();       // Извлекаем ID пользователя
+        QString username = query.value(1).toString();  // Извлекаем имя пользователя
+        QString password = query.value(2).toString();  // Извлекаем пароль пользователя
+        QString ip = query.value(3).toString();      // Извлекаем IP пользователя
+
+        // Сохраняем текущие значения
+        current_ip_ = ip.toStdString();
+        current_hashed_password_ = password.toStdString();
+
+        // Логируем информацию о пользователе
+        qDebug() << "ID: " << userId << "Username: " << username << "Password: " << password << "IP: " << ip;
+        return true;
+    } else {
+        // Если пользователь не найден, выводим соответствующее сообщение
+        qDebug() << "Пользователь не найден.";
+        return false;
+    }
+}
+// Функция для получения текущего IP
+std::string base::getCurrentIP() const {
+    return current_ip_;  // Возвращает текущий IP пользователя
+}
+
+// Функция для получения текущего хешированного пароля
+std::string base::getCurrentHashedPassword() const {
+    return current_hashed_password_;  // Возвращает текущий хешированный пароль пользователя
+}
+
+// Функция для вывода ошибки SQL-запроса
+void base::printQueryError(const QSqlQuery& query, const std::string& queryType) {
+    // Выводит сообщение об ошибке, связанной с выполнением SQL-запроса
+    qCritical() << "Ошибка SQL-запроса типа:" << QString::fromStdString(queryType)
+                << "с сообщением:" << query.lastError().text();
+}
+
+
+================================================================================
+// Файл: Base/database.h
+================================================================================
+
+#pragma once
+#include <string>
+#include <vector>
+#include <memory>
+#include "logger.h"
+#include <filesystem>
+#include <QCoreApplication>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QDebug>
+#include <QFileInfo>
+#include <QString>
+#include <QDebug>
+class base {
+private:
+    QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE");
+    QSqlQuery query;
+
+public:
+    base();
+    bool connectToDatabase(const std::string& dbName);
+    bool insertUser(const std::string& username, const std::string& password, const std::string& ip);
+    bool selectUserByName(std::string name);
+    void printQueryError(const QSqlQuery& query, const std::string& queryType);
+    std::string current_ip_;
+    std::string current_hashed_password_;
+    std::string getCurrentIP() const;
+    std::string getCurrentHashedPassword() const;
+};
+
+
+================================================================================
+// Файл: Error/error.h
+================================================================================
+
+#pragma once
+#include <stdexcept>
+#include <string>
+/** Класс ошибок
+*  Используется для отлова специфических ошибок, возникающих в ходе работы модулей
+*  В конструкторе указывается строка с сообщением ошибки
+*/
+class critical_error:public std::runtime_error{
+    public:
+    /** Конструктор ошибки
+    * s Сообщение об ошибке
+    */
+    critical_error(const std::string& s):std::runtime_error(s){}
+};
+
+================================================================================
+// Файл: Crypto_utils/crypto_utils.cpp
+================================================================================
+
+#include "crypto_utils.h"
+
+// --- Заголовочные файлы Crypto++ ---
+// Для хеширования (SHA-256)
+#include "cryptopp/sha.h"
+
+// Для генерации случайных чисел
+#include "cryptopp/osrng.h" // AutoSeededRandomPool
+
+// Для кодирования/декодирования и работы с потоками данных
+#include "cryptopp/filters.h" // StringSource, HashFilter, ...
+#include "cryptopp/hex.h"     // HexEncoder
+#include "cryptopp/secblock.h" // SecByteBlock
+
+
+namespace CryptoUtils {
+
+// Реализация функции хеширования
+std::string generate_hash(const std::string& input) {
+    // 1. Создаем объект алгоритма хеширования SHA-256.
+    CryptoPP::SHA256 hash_algorithm;
+
+    // 2. Создаем строку, которая будет хранить результат в виде дайджеста.
+    std::string digest;
+
+    // 3. Создаем "конвейер" для обработки данных:
+    //    - StringSource: Источник данных - наша входная строка 'input'.
+    //    - HashFilter: Фильтр, который применяет к данным 'hash_algorithm'.
+    //    - HexEncoder: Кодировщик, который преобразует бинарный дайджест в HEX-строку.
+    //    - StringSink: "Приемник" данных, который помещает результат в строку 'digest'.
+    //    Параметр 'true' в StringSource означает "putNextMessage".
+    CryptoPP::StringSource(input, true, 
+        new CryptoPP::HashFilter(hash_algorithm,
+            new CryptoPP::HexEncoder(
+                new CryptoPP::StringSink(digest)
+            )
+        )
+    );
+
+    return digest;
+}
+
+
+// Реализация функции генерации случайной строки
+std::string generate_random_hex_string(size_t byte_length) {
+    // 1. Создаем объект криптографически стойкого генератора псевдослучайных чисел (CSPRNG).
+    //    AutoSeededRandomPool автоматически "засеивается" энтропией из операционной системы,
+    //    что делает его непредсказуемым.
+    CryptoPP::AutoSeededRandomPool prng;
+
+    // 2. Создаем безопасный блок байт (SecByteBlock) для хранения случайных данных.
+    //    SecByteBlock автоматически обнуляет память при уничтожении, чтобы
+    //    предотвратить утечку чувствительных данных.
+    CryptoPP::SecByteBlock random_bytes(byte_length);
+    
+    // 3. Заполняем блок случайными данными.
+    prng.GenerateBlock(random_bytes, random_bytes.size());
+
+    // 4. Кодируем сырые байты в шестнадцатеричную строку.
+    std::string hex_encoded_string;
+    CryptoPP::StringSource(random_bytes, random_bytes.size(), true,
+        new CryptoPP::HexEncoder(
+            new CryptoPP::StringSink(hex_encoded_string)
+        )
+    );
+
+    return hex_encoded_string;
+}
+
+} // namespace CryptoUtils
+
+================================================================================
+// Файл: Crypto_utils/crypto_utils.h
+================================================================================
+
+// crypto_utils.h
+#pragma once
+#include <string>
+
+namespace CryptoUtils {
+    // Хеширует строку с помощью SHA-256 и возвращает HEX
+    std::string generate_hash(const std::string& input);
+
+    // Генерирует крипто-стойкую случайную HEX-строку
+    std::string generate_random_hex_string(size_t byte_length);
+}
+
+================================================================================
+// Файл: Server/communicator.cpp
+================================================================================
+
+#include "communicator.h"
+
+int communicator::connect_to_cl(int &new_socket, sockaddr_in &out_clientAddr)
+{
+    const std::string method_name = "connect_to_cl";
+
+    // Начало прослушивания порта
+    if (listen(serverSocket, 10) != 0)
+    {
+        log.write_log(log_location, method_name + " | Ошибка при прослушивании порта");
+        throw critical_error("Сервер не встал на прослушку");
+    }
+    std::cout << "[INFO] [" << method_name << "] Ожидание подключения клиента" << std::endl;
+    log.write_log(log_location, method_name + " | Ожидание подключения клиента...");
+    addr_size = sizeof(out_clientAddr);
+    new_socket = accept(serverSocket, (struct sockaddr *)&out_clientAddr, &addr_size);
+    if (new_socket < 0)
+    {
+        log.write_log(log_location, method_name + " | Ошибка принятия соединения");
+        std::cerr << "[ERROR] [" << method_name << "] Ошибка при принятии соединения!" << std::endl;
+        return -1;
+    }
+
+    // Логируем информацию о клиенте
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(out_clientAddr.sin_addr), client_ip, INET_ADDRSTRLEN);
+    int client_port = ntohs(out_clientAddr.sin_port);
+    log.write_log(log_location, method_name + " | Подключен клиент | IP: " + std::string(client_ip) + " | Порт: " + std::to_string(client_port));
+
+    return 0;
+}
+
+bool communicator::authentification(int client_socket, const std::string& cl_id) {
+    const std::string method_name = "perform_authentication";
+
+    // 1. Проверить, есть ли пользователь в БД
+    if (db.selectUserByName(cl_id) == 0) {
+        log.write_log(log_location, method_name + " | Клиент не найден | ID: " + cl_id);
+        send_data(client_socket, "AUTH_FAIL", cl_id, -1, "User not found");
+        return false;
+    }
+
+    // 2. Сгенерировать, сохранить и отправить "Вызов" (nonce)
+    std::string nonce = generate_random_string(16); // Генерируем nonce
+
+    { // Блок для защиты std::lock_guard
+        std::lock_guard<std::mutex> lock(challenges_mutex);
+        active_challenges[client_socket] = nonce; // Сохраняем nonce для этого сокета
+    }
+
+    if (send_data(client_socket, "CHALLENGE", "server", -1, nonce) != 0) {
+        return false; // Ошибка отправки
+    }
+
+    // 3. Получить "Ответ" от клиента
+    std::string client_response = recv_data(client_socket, "Ошибка приема ответа");
+    if (client_response.empty()) {
+        log.write_log(log_location, method_name + " | Не получен ответ от клиента | ID: " + cl_id);
+        return false;
+    }
+    
+    // 4. Проверить "Ответ"
+    std::string password_hash_from_db = db.getCurrentHashedPassword(); // Получаем хеш пароля из БД
+    std::string expected_response = hash_gen(password_hash_from_db + nonce); // Сами считаем, как должно быть
+
+    // Обязательно удаляем nonce после использования, чтобы его нельзя было использовать повторно
+    {
+        std::lock_guard<std::mutex> lock(challenges_mutex);
+        active_challenges.erase(client_socket);
+    }
+    
+    if (client_response == expected_response) {
+        // Успех!
+        send_data(client_socket, "AUTH_OK", cl_id, -1, "Authentication successful");
+        return true;
+    } else {
+        // Неудача!
+        log.write_log(log_location, method_name + " | Неверный ответ на вызов | ID: " + cl_id);
+        send_data(client_socket, "AUTH_FAIL", cl_id, -1, "Invalid response");
+        return false;
+    }
+}
+
+int communicator::registration(int client_socket, std::string cl_id)
+{
+    const std::string method_name = "registration";
+
+    // Проверка валидности сокета
+    if (client_socket < 0)
+    {
+        log.write_log(log_location, method_name + " | Некорректный сокет клиента");
+        std::cerr << "[ERROR] [" << method_name << "] Некорректный сокет клиента" << std::endl;
+        return 1;
+    }
+
+    // Генерация уникального ID сообщения
+    int msg_id = MessageProtocol::generateMessageID();
+
+    // Получаем IP клиента
+    sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(client_socket, reinterpret_cast<struct sockaddr *>(&addr), &addr_len) < 0)
+    {
+        log.write_log(log_location, method_name + " | Не удалось получить IP клиента");
+    }
+    char client_ip_cstr[INET_ADDRSTRLEN] = "";
+    inet_ntop(AF_INET, &addr.sin_addr, client_ip_cstr, INET_ADDRSTRLEN);
+    std::string client_ip_str = client_ip_cstr;
+
+    log.write_log(log_location, method_name + " | Начата регистрация клиента | ID: " + cl_id + " | IP: " + client_ip_str);
+    std::cout << "[INFO] [" << method_name << "] Регистрация клиента [" << cl_id << "] с IP " << client_ip_str << std::endl;
+
+    // Получаем пароль от клиента
+    std::string password = recv_data(client_socket, "Ошибка при приеме пароля");
+    if (password.empty())
+    {
+        log.write_log(log_location, method_name + " | Не получен пароль клиента | ID: " + cl_id + " | IP: " + client_ip_str);
+        std::cerr << "[ERROR] [" << method_name << "] Не удалось получить пароль от клиента [" << cl_id << "]" << std::endl;
+        close_sock(client_socket);
+        return 1;
+    }
+
+    // Вставляем нового пользователя в базу данных
+    if (db.insertUser(cl_id, password, client_ip_str) == false)
+    {
+        send_data(client_socket, "REG_OK", cl_id, msg_id, "Ошибка регистрации");
+        close_sock(client_socket);
+        std::cout << "[INFO] [" << method_name << "] Регистрация клиента [" << cl_id << "] не завершена, ошибка при запросе к БД" << std::endl;
+        return 1;
+    }
+
+    // Отправляем клиенту протокольное сообщение об успешной регистрации
+    send_data(client_socket, "REG_OK", cl_id, msg_id, "Регистрация успешна");
+
+    log.write_log(log_location, method_name + " | Регистрация завершена успешно | ID: " + cl_id + " | IP: " + client_ip_str);
+    std::cout << "[INFO] [" << method_name << "] Регистрация клиента [" << cl_id << "] завершена успешно" << std::endl;
+
+    // Закрываем соединение
+    close_sock(client_socket);
+}
+
+communicator::communicator(uint port, std::string log_loc)
+{
+    p = port;
+    // base_location = base_loc;
+    log_location = log_loc;
+}
+void communicator::work()
+{
+    const std::string method_name = "work";
+    log.write_log(log_location, method_name + " | Запуск основного цикла сервера");
+    std::cout << "[INFO] [" << method_name << "] Сервер запущен и ожидает подключения клиентов..." << std::endl;
+
+    start();
+
+    while (true)
+    {
+        int new_socket;
+        sockaddr_in client_addr;
+        int result = connect_to_cl(new_socket, client_addr);
+
+        if (result != 0)
+        {
+            log.write_log(log_location, method_name + " | Ошибка при подключении клиента");
+            std::cerr << "[ERROR] [" << method_name << "] Ошибка подключения клиента, продолжаем ожидание..." << std::endl;
+            continue;
+        }
+        int prev = active_clients.fetch_add(1);
+        // Проверяем, есть ли свободный слот
+        if (prev >= 3)
+        {
+            active_clients.fetch_sub(1);
+            send_data(new_socket, "CONN_ERR", "server", -1, "Сервер полон");
+            close_sock(new_socket);
+
+            log.write_log(log_location, method_name + " | Отклонено подключение: очередь заполнена");
+            std::cout << "[INFO] [" << method_name << "] Отклонено новое подключение: очередь заполнена." << std::endl;
+            continue;
+        }
+        send_data(new_socket, "CONN_OK", "server", -1, "Подключение успешно");
+        // Логируем успешное подключение клиента и создание потока
+        log.write_log(log_location, method_name + " | Подключение клиента принято, создаётся поток для обработки");
+        std::cout << "[INFO] [" << method_name << "] Принято новое подключение. Запуск потока обработки клиента." << std::endl;
+
+        // Создаем поток
+        std::thread client_thread(&communicator::handle_client, this, new_socket, client_addr);
+        client_thread.detach();
+    }
+}
+
+void communicator::handle_client(int client_socket, sockaddr_in clientAddr)
+{
+    const std::string method_name = "handle_client";
+    // active_clients.fetch_add(1);
+    try
+    {
+        // Получаем ID клиента
+        std::string cl_id = recv_data(client_socket, method_name + " | Ошибка при приеме ID клиента");
+        std::string operation_type = recv_data(client_socket, method_name + " | Ошибка при приеме типа операции");
+
+        // Получаем IP клиента
+        char ip_buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(clientAddr.sin_addr), ip_buf, INET_ADDRSTRLEN);
+        std::string client_ip = ip_buf;
+
+        // Логируем подключение клиента
+        log.write_log(log_location, method_name + " | Установлено соединение с клиентом | ID: " + cl_id + " | IP: " + client_ip);
+        std::cout << "[INFO] [" << method_name << "] Подключение от клиента: ID = " << cl_id << ", IP = " << client_ip << std::endl;
+
+        // Небольшая задержка для синхронизации
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::cout << "[INFO] [" << method_name << "] Получен тип операции: " << operation_type << std::endl;
+        if (operation_type == "0")
+        {
+            log.write_log(log_location, method_name + " | Регистрация нового клиента | ID: " + cl_id + " | IP: " + client_ip);
+            if (registration(client_socket, cl_id) == 1)
+            {
+                active_clients.fetch_sub(1);
+                return;
+            }
+            close_sock(client_socket);
+            active_clients.fetch_sub(1);
+            return;
+        }
+        else
+        {
+            // Аутентификация клиента
+            if (authentification(client_socket, cl_id) == 0)
+            {
+                log.write_log(log_location, method_name + " | Аутентификация не пройдена | ID: " + cl_id + " | IP: " + client_ip);
+                active_clients.fetch_sub(1);
+                return;
+            }
+            std::cout << "[INFO] [" << method_name << "] Успешная аутентификация клиента: " << cl_id << std::endl;
+            log.write_log(log_location, method_name + " | Аутентификация пройдена | ID: " + cl_id + " | IP: " + client_ip);
+        }
+        RSAKeyPair keyPair(keyLength);
+        while (true)
+        {
+            std::string sig_op = recv_data(client_socket, "Ошибка при приеме типа операции с подписью");
+            if(sig_op==""){
+                return;
+            }
+            if (sig_op == "11")
+            {
+                std::cout << "[INFO] [" << method_name << "] Начала процесса подписи файла" << std::endl;
+                std::string hash_file = recv_data(client_socket, "Ошибка при приеме хеша файла для подписи");
+                BigInt d, n, e;
+                try
+                {
+                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
+                    d = loadKeyFromFile("private.key");
+                    n = loadKeyFromFile("public_n.key");
+                    e = loadKeyFromFile("public_e.key");
+                    std::cout << "Keys loaded from files.\n";
+                }
+                catch (const std::exception &ex)
+                {
+                    std::cerr << "Не найдены ключи , необходимо запросить новые: " << ex.what() << std::endl;
+                    send_data(client_socket, "KEY_ERR", cl_id, 1, "Не найдены персональные ключи клиента, необходимо запросить новые");
+                    close_sock(client_socket);
+                    break;
+                }
+
+                std::cout << "Received hash (HEX): " << hash_file << std::endl;
+
+                // Конвертируем полученный HEX-хеш в вектор байт
+                std::vector<unsigned char> byteVector = hexStringToBytes(hash_file);
+
+                // *ИСПРАВЛЕНИЕ:* Используем вектор байт `byteVector` для создания BigInt
+                BigInt hashInt = fromBytes(byteVector);
+                hashInt.printHex("   Hash as BigInt: ");
+
+                // 1. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
+                std::cout << "Generating signature..." << std::endl;
+                BigInt signature = rsa_mod_exp(hashInt, d, n);
+                signature.printHex("   Generated Signature (BigInt): ");
+
+                // 2. Конвертируем объект подписи BigInt в HEX-строку для отправки клиенту
+                std::string signature_hex = signature.toHexString();
+                std::cout << "   Signature to send (HEX): " << signature_hex << std::endl;
+                // 3. Отправляем сгенерированную подпись обратно клиенту
+                send_data(client_socket, "SIG_SEND", cl_id, 1, signature_hex);
+                std::cout << "Signature successfully sent to client " << cl_id << std::endl;
+                continue;
+            }
+            if (sig_op == "22")
+            {
+                std::cout << "[INFO] [" << method_name << "] Начала процесса отправки открытого ключа подписи для ее проверки" << std::endl;
+                BigInt d, n, e;
+                try
+                {
+                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
+                    d = loadKeyFromFile("private.key");
+                    n = loadKeyFromFile("public_n.key");
+                    e = loadKeyFromFile("public_e.key");
+                    std::cout << "Keys loaded from files.\n";
+                }
+                catch (const std::exception &ex)
+                {
+                    std::cerr << "Не найдены ключи, необходимо запросить новые: " << ex.what() << std::endl;
+                    send_data(client_socket, "KEY_ERR", cl_id, 1, "Не найдены ключи , необходимо запросить новые");
+                    break;
+                }
+                send_data(client_socket, "OP_KEY", cl_id, 1, n.toHexString());
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                send_data(client_socket, "EKSP", cl_id, 1, e.toHexString());
+                continue;
+            }
+            if (sig_op == "111")
+            {
+                std::cout << "[INFO] [" << method_name << "] Начала процесса подписи файла" << std::endl;
+                std::string hash_file = recv_data(client_socket, "Ошибка при приеме хеша файла для подписи");
+
+                // Сохраняем ключи. Имена файлов уникальны для клиента (cl_id)
+                saveKeyToFile("private.key", keyPair.d);
+                saveKeyToFile("public_n.key", keyPair.n);
+                saveKeyToFile("public_e.key", keyPair.e);
+
+                BigInt d, n, e;
+                try
+                {
+                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
+                    d = loadKeyFromFile("private.key");
+                    n = loadKeyFromFile("public_n.key");
+                    e = loadKeyFromFile("public_e.key");
+                    std::cout << "Keys loaded from files.\n";
+                }
+                catch (const std::exception &ex)
+                {
+                    std::cerr << "Не найдены ключи , необходимо запросить новые: " << ex.what() << std::endl;
+                    send_data(client_socket, "KEY_ERR", cl_id, 1, "Не найдены ключи , необходимо запросить новые");
+                    break;
+                }
+
+                std::cout << "Received hash (HEX): " << hash_file << std::endl;
+
+                // Конвертируем полученный HEX-хеш в вектор байт
+                std::vector<unsigned char> byteVector = hexStringToBytes(hash_file);
+
+                // *ИСПРАВЛЕНИЕ:* Используем вектор байт `byteVector` для создания BigInt
+                BigInt hashInt = fromBytes(byteVector);
+                hashInt.printHex("   Hash as BigInt: ");
+
+                // 1. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
+                std::cout << "Generating signature..." << std::endl;
+                BigInt signature = rsa_mod_exp(hashInt, d, n);
+                signature.printHex("   Generated Signature (BigInt): ");
+                // 2. Конвертируем объект подписи BigInt в HEX-строку для отправки клиенту
+                std::string signature_hex = signature.toHexString();
+                std::cout << "   Signature to send (HEX): " << signature_hex << std::endl;
+                // 3. Отправляем сгенерированную подпись обратно клиенту
+                send_data(client_socket, "SIG_SEND", cl_id, 1, signature_hex);
+                std::cout << "Signature successfully sent to client " << cl_id << std::endl;
+                continue;
+            }
+            if(sig_op == "0"){
+                close_sock(client_socket);
+                return;
+            }
+        }
+        active_clients.fetch_sub(1);
+    }
+    catch (const std::exception &e)
+    {
+        send_data(client_socket, "KEY_ERR", cl_id, 1, "Ошибка: "+std::string(e.what()));
+        // Логируем и выводим ошибку при исключении
+        log.write_log(log_location, method_name + " | Критическая ошибка обработки клиента: " + std::string(e.what()));
+        std::cerr << "[ERROR] [" << method_name << "] Исключение при обработке клиента: " << e.what() << std::endl;
+        active_clients.fetch_sub(1);
+        close_sock(client_socket);
+    }
+}
+void communicator::start()
+{
+    const std::string method_name = "start";
+
+    // Создание сокета для сервера
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0)
+    {
+        log.write_log(log_location, method_name + " | Ошибка при создании сокета");
+        std::cerr << "[ERROR] [" << method_name << "] Ошибка при создании сокета" << std::endl;
+        throw critical_error("Сокет не был создан");
+    }
+
+    // Логируем успешное создание сокета
+    log.write_log(log_location, method_name + " | Сокет для сервера создан");
+    std::cout << "[INFO] [" << method_name << "] Сокет создан" << std::endl;
+
+    // Настройка структуры адреса для привязки
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(p);          // Устанавливаем порт
+    serverAddr.sin_addr.s_addr = INADDR_ANY; // Принимаем соединения с любого IP
+
+    // Привязка сокета к адресу
+    if (bind(serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+    {
+        log.write_log(log_location, method_name + " | Ошибка при привязке сокета");
+        std::cerr << "[ERROR] [" << method_name << "] Ошибка при привязке сокета" << std::endl;
+        throw critical_error("Сокет не был привязан");
+    }
+
+    // Логируем успешную привязку сокета
+    log.write_log(log_location, method_name + " | Сокет привязан");
+    std::cout << "[INFO] [" << method_name << "] Сокет привязан" << std::endl;
+}
+
+std::string communicator::recv_data(int client_socket, std::string error_msg)
+{
+    const std::string method_name = "recv_data";
+
+    // Устанавливаем таймаут на приём данных
+    /*timeout.tv_sec = 100;
+    timeout.tv_usec = 0;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));*/
+
+    std::vector<char> buffer(buflen);
+    int received_bytes = recv(client_socket, buffer.data(), buflen, MSG_NOSIGNAL);
+
+    if (received_bytes <= 0)
+    {
+        close_sock(client_socket);
+        log.write_log(log_location, method_name + " | Ошибка или закрыто соединение: " + error_msg);
+        std::cerr << "[ERROR] [" << method_name << "] " << error_msg << std::endl;
+        return "";
+    }
+
+    try
+    {
+        std::string raw_data(buffer.data(), received_bytes);
+        log.write_log(log_location, method_name + " | Принято протокольное сообщение от клиента (ID: " + std::to_string(client_socket) + "): " + raw_data);
+        MessageProtocol::ParsedMessage message = MessageProtocol::parse(raw_data);
+        std::cout << "[INFO] [" << method_name << "] Принято сообщение: " << message.message << std::endl;
+        return message.message; // Возвращаем только полезную нагрузку
+    }
+    catch (const std::exception &e)
+    {
+        log.write_log(log_location, method_name + " | Ошибка парсинга протокольного сообщения: " + std::string(e.what()));
+        std::cerr << "[ERROR] [" << method_name << "] Ошибка парсинга: " << e.what() << std::endl;
+        return "";
+    }
+}
+int communicator::send_data(int client_socket, const std::string &header,
+                            const std::string &client_id, int message_id,
+                            const std::string &msg)
+{
+    const std::string method_name = "send_data";
+
+    if (client_socket < 0)
+    {
+        log.write_log(log_location, method_name + " | Некорректный сокет клиента");
+        std::cerr << "[ERROR] [" << method_name << "] Некорректный сокет клиента" << std::endl;
+        return 1;
+    }
+
+    log.write_log(log_location, method_name + " | Подготовка отправки данных клиенту (ID: " + std::to_string(client_socket) + ")");
+    std::cout << "[INFO] [" << method_name << "] Подготовка отправки данных клиенту (ID: " << client_socket << ")" << std::endl;
+
+    // 1) формируем основной пакет с полезной нагрузкой
+    std::string packet = MessageProtocol::build(header, client_id, message_id, msg);
+
+    // 2) формируем пакет LENGTH по протоколу, содержащий длину payload
+    std::string len_payload = std::to_string(packet.size());
+    std::string len_packet = MessageProtocol::build("LENGTH", client_id, message_id, len_payload);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // отправляем пакет LENGTH целиком
+    size_t sent = 0;
+    const char *len_data = len_packet.data();
+    size_t len_size = len_packet.size();
+    while (sent < len_size)
+    {
+        int n = send(client_socket, len_data + sent, len_size - sent, MSG_NOSIGNAL);
+        if (n <= 0)
+        {
+            log.write_log(log_location, method_name + " | Ошибка отправки LENGTH" + std::to_string(sent) + " байт");
+            std::cerr << "[ERROR] [" << method_name << "] Ошибка отправки LENGTH, n=" << n << std::endl;
+            // close_sock(client_socket);
+            return 1;
+        }
+        sent += n;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    // 3) отправляем основной пакет целиком
+    sent = 0;
+    const char *data = packet.data();
+    size_t packet_size = packet.size();
+    while (sent < packet_size)
+    {
+        int n = send(client_socket, data + sent, packet_size - sent, 0);
+        if (n <= 0)
+        {
+            log.write_log(log_location, method_name + " | Ошибка отправки DATA после " + std::to_string(sent) + " байт");
+            std::cerr << "[ERROR] [" << method_name << "] Ошибка отправки DATA, n=" << n << std::endl;
+            // close_sock(client_socket);
+            return 1;
+        }
+        sent += n;
+    }
+
+    log.write_log(log_location, method_name + " | Успешно отправлено пакетов LENGTH и " + header + " клиенту (ID: " + std::to_string(client_socket) + ")");
+    std::cout << "[INFO] [" << method_name << "] Успешно отправлено пакетов LENGTH и " << header << " клиенту (ID: " << client_socket << ")" << std::endl;
+}
+
+void communicator::close_sock(int client_socket)
+{
+    const std::string method_name = "close_sock";
+
+    // Логируем разрыв соединения
+    log.write_log(log_location, method_name + " | Разорвано соединение с клиентом (ID: " + std::to_string(client_socket) + ")");
+    std::cout << "[INFO] [" << method_name << "] Разорвано соединение с клиентом (ID: " << client_socket << ")" << std::endl;
+    close(client_socket);
+
+    // Дополнительно, если нужно записывать дату и время разрыва соединения
+    std::time_t now = std::time(nullptr);
+    char timestamp[100];
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    log.write_log(log_location, method_name + " | Время разрыва соединения: " + timestamp);
+}
+
+std::string communicator::hash_gen(std::string &password)
+{
+    // Создаем объект для алгоритма хэширования SHA256
+    CryptoPP::SHA256 hash;
+    std::string hashed_password;
+
+    // Применяем хэширование:
+    // StringSource - источник данных (строка с паролем), передаем его в хэш-фильтр
+    // HashFilter - фильтрует и хэширует данные через алгоритм SHA256
+    // HexEncoder - кодирует результат хэширования в строку в формате шестнадцатеричных символов
+    // StringSink - принимает результат в виде строки
+    CryptoPP::StringSource(password, true,
+                           new CryptoPP::HashFilter(hash,
+                                                    new CryptoPP::HexEncoder(
+                                                        new CryptoPP::StringSink(hashed_password))));
+
+    // Возвращаем хэшированную строку пароля
+    return hashed_password;
+}
+std::string communicator::generate_random_string(size_t byte_length) {
+    // 1. Создаем объект криптографически стойкого генератора случайных чисел.
+    //    AutoSeededRandomPool автоматически собирает энтропию из различных
+    //    источников операционной системы (движения мыши, сетевая активность и т.д.).
+    CryptoPP::AutoSeededRandomPool prng;
+
+    // 2. Создаем массив байт для хранения случайных данных.
+    CryptoPP::SecByteBlock random_bytes(byte_length);
+    
+    // 3. Заполняем массив случайными данными из генератора.
+    prng.GenerateBlock(random_bytes, random_bytes.size());
+
+    // 4. Кодируем сырые байты в шестнадцатеричную строку (hex) для удобной
+    //    передачи по сети и использования.
+    std::string hex_encoded_string;
+    CryptoPP::StringSource(random_bytes, random_bytes.size(), true,
+        new CryptoPP::HexEncoder(
+            new CryptoPP::StringSink(hex_encoded_string)
+        ) // HexEncoder
+    ); // StringSource
+
+    return hex_encoded_string;
+}
+
+================================================================================
+// Файл: Server/communicator.h
+================================================================================
+
+#pragma once
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cstring>
+#include <algorithm>
+#include <memory>
+#include <stdlib.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <atomic>
+#include <random>
+#include <chrono>
+#include <thread>
+#include <limits>
+#include "logger.h"
+#include "error.h"
+#include "data_handler.h"
+#include <cryptopp/cryptlib.h>
+#include <cryptopp/hex.h>
+#include <cryptopp/files.h>
+#include <cryptopp/sha.h>
+#include <cryptopp/filters.h>
+#include <cryptopp/osrng.h>
+#include "base.h"
+#include "protocol.h"
+#include "rsa_crypto.h"
+class communicator
+{
+private:
+    const size_t keyLength = 2048;
+    base db;
+    struct sockaddr_in serverAddr, clientAddr;
+    socklen_t addr_size;
+    std::string base_location;
+    size_t buflen = 65536;
+    std::unique_ptr<char[]> buffer{new char[buflen]};
+    uint p;
+    std::string digits[16] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"};
+
+public:
+    int serverSocket;
+    logger log;
+    std::string cl_id, log_location;
+    timeval timeout{};
+    std::atomic<int> active_clients{0};
+    communicator(uint port, std::string log_loc);
+
+    int connect_to_cl(int &new_socket, sockaddr_in &out_clientAddr);
+    int send_data(int client_socket, const std::string &header, const std::string &client_id, int message_id, const std::string &msg);
+    std::string recv_data(int client_socket, std::string messg);
+    void close_sock(int sock);
+    void work();
+    void start();
+    int send_file_list(int client_socket);
+    int send_file(int client_socket, std::string &file_path);
+    int file_exchange(int client_socket);
+    //int authentification(int client_socket, std::string cl_id);
+    int registration(int client_socket, std::string cl_id);
+    void handle_client(int client_socket, sockaddr_in clientAddr);
+    void do_operation(std::string op);
+    std::string hash_gen(std::string &password);
+    std::map<int, std::string> active_challenges;
+    std::mutex challenges_mutex; 
+    bool authentification(int client_socket, const std::string& cl_id);
+    std::string generate_random_string(size_t length);
+};
+
+
+================================================================================
+// Файл: UI/ui.cpp
+================================================================================
+
+#include "ui.h"
+#include <boost/program_options.hpp>
+namespace po = boost::program_options;
+UI::UI(int argc, char* argv[]) {
+    // Добавление опций командной строки
+    desc.add_options()
+        ("help,h", "Помощь")  // Опция для вывода справки
+        ("Log_loc,l", po::value<std::vector<std::string>>()->multitoken(), "Путь для log файла")  // Опция для указания пути к лог-файлу
+        ("Port,p", po::value<std::vector<uint>>()->multitoken(), "Порт сервера(1025-65534)");  // Опция для указания портов сервера
+
+    try {
+        // Парсинг командной строки
+        po::store(po::parse_command_line(argc, argv, desc), vm);
+
+        // Если указана опция "help" или отсутствуют обязательные параметры ("Log_loc" или "Port"), выводим справку и завершаем программу
+        if (vm.count("help") || !vm.count("Log_loc") || !vm.count("Port")) {
+            std::cout << desc << std::endl;
+            exit(0);  // Выход из программы, если не все параметры указаны
+        }
+
+        // Применяем опции, если парсинг прошел успешно
+        po::notify(vm);
+    } catch (po::error& e) {
+        // Обработка ошибок парсинга опций
+        std::cout << e.what() << std::endl;
+    }
+    catch(critical_error &e){
+        // Обработка критических ошибок
+        std::cout << "Критическая ошибка: " << e.what() << std::endl;
+    }
+}
+uint UI::get_port()
+{
+    if (vm.count("Port") and !vm["Port"].as<std::vector<uint>>().empty())
+    {
+        const std::vector<uint> &ports = vm["Port"].as<std::vector<uint>>();
+        
+        // Проверка на допустимые значения диапазона портов
+        if (ports.back() < 1024)
+        {
+            std::cout<<"Неверное значение порта"<<std::endl;
+            std::cout << desc << std::endl;
+            exit(0); 
+            return 1;
+        }
+        if (ports.back() > 65535)
+        {
+            std::cout<<"Неверное значение порта"<<std::endl;
+            std::cout << desc << std::endl;
+            exit(0); 
+            return 1;
+        }
+
+        return ports.back();
+    }
+    else
+    {
+        // Если порт не передан — выводим справку и сообщение об ошибке
+        std::cout << desc << std::endl;
+        return 1;
+    }
+}
+
+std::string UI::get_log_loc() {
+    // Проверка, была ли указана опция "Log_loc"
+    if (vm.count("Log_loc")) {
+        const std::vector<std::string>& log_loc = vm["Log_loc"].as<std::vector<std::string>>();  // Извлекаем путь к лог-файлу
+        return log_loc.back();  // Возвращаем последний указанный путь
+    } else {
+        return "";  // Если путь не указан, возвращаем пустую строку
+    }
+}
+
+
+================================================================================
+// Файл: UI/ui.h
+================================================================================
+
+
+#pragma once
+#include <boost/program_options.hpp>
+#include <iostream>
+#include <string>
+#include <vector>
+#include "communicator.h"
+#include "error.h"
+#include "logger.h"
+namespace po = boost::program_options;
+class UI
+{
+private:
+    uint port;
+    std::string base_loc;
+public:
+    logger log;
+    po::options_description desc;
+    po::variables_map vm;
+    std::string log_loc;
+    UI(int argc, char* argv[]);
+    uint get_port();
+    std::string get_log_loc();
+};
+
+================================================================================
+// Файл: Auth_reg/auth_service.cpp
+================================================================================
+
+#include "auth_service.h"
+
+#include <iostream>
+
+// Подключаем утилиты и протокол
+#include "../Crypto_utils/crypto_utils.h"
+#include "../Protocol/protocol.h"
+#include "../Protocol_utils/protocol_utils.h"
+#include "../Error/error.h"
+
+// --- Конструктор ---
+AuthService::AuthService(base& db, logger& logger_instance, const std::string& log_path)
+    : db_ref(db), logger_ref(logger_instance), log_location(log_path) 
+{
+    logger_ref.write_log(log_location, "[INFO] [AuthService] Сервис аутентификации и регистрации инициализирован.");
+}
+
+
+// --- Аутентификация ---
+bool AuthService::authenticateClient(int socket, const std::string& client_id) {
+    const std::string log_prefix = "[AuthService] [Authenticate] | ClientID: " + client_id + " | ";
+
+    // 1. ВЫБИРАЕМ пользователя и ЗАГРУЖАЕМ его данные в объект db_ref
+    // Этот метод теперь выполняет две функции: проверяет существование и готовит данные
+    if (!db_ref.selectUserByName(client_id)) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - User not found in database.");
+        std::cerr << "[WARN] " << log_prefix << "Попытка входа для несуществующего пользователя." << std::endl;
+        
+        std::string packet = MessageProtocol::build("AUTH_FAIL", client_id, -1, "User not found");
+        ProtocolUtils::send_packet(socket, packet);
+        return false;
+    }
+
+    // --- Логика Challenge-Response остается прежней ---
+
+    // 2. Генерируем "Вызов" (nonce)
+    std::string nonce = CryptoUtils::generate_random_hex_string(16);
+    {
+        std::lock_guard<std::mutex> lock(challenges_mutex);
+        active_challenges[socket] = nonce;
+    }
+
+    // 3. Отправляем nonce клиенту
+    logger_ref.write_log(log_location, log_prefix + "Sending challenge.");
+    std::string challenge_packet = MessageProtocol::build("CHALLENGE", "server", -1, nonce);
+    if (ProtocolUtils::send_packet(socket, challenge_packet) != 0) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - Could not send challenge packet.");
+        removeChallenge(socket);
+        return false;
+    }
+
+    // 4. Получаем "Ответ" от клиента
+    std::string response_packet_raw = ProtocolUtils::receive_packet(socket, 1024);
+    if (response_packet_raw.empty()) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - Client disconnected before sending response.");
+        removeChallenge(socket);
+        return false;
+    }
+
+    std::string client_response;
+    try {
+        client_response = MessageProtocol::parse(response_packet_raw).message;
+    } catch (const std::exception& e) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - Invalid response format. Error: " + e.what());
+        removeChallenge(socket);
+        return false;
+    }
+    
+    // 5. Проверяем "Ответ"
+    // ПОЛУЧАЕМ хеш пароля, который был загружен на шаге 1
+    std::string password_hash_from_db = db_ref.getCurrentHashedPassword();
+    if (password_hash_from_db.empty()) {
+        // Эта ситуация маловероятна, если selectUserByName вернул true, но лучше проверить
+        logger_ref.write_log(log_location, log_prefix + "Critical Failure - User found, but no password hash available.");
+        removeChallenge(socket);
+        return false;
+    }
+    
+    // Вычисляем ожидаемый ответ
+    std::string expected_response = CryptoUtils::generate_hash(password_hash_from_db + nonce);
+    removeChallenge(socket);
+
+    if (client_response == expected_response) {
+        // Успех!
+        logger_ref.write_log(log_location, log_prefix + "Success - Authentication successful.");
+        std::cout << "[INFO] " << log_prefix << "Аутентификация прошла успешно." << std::endl;
+        std::string ok_packet = MessageProtocol::build("AUTH_OK", client_id, -1, "Authentication successful");
+        ProtocolUtils::send_packet(socket, ok_packet);
+        return true;
+    } else {
+        // Неудача
+        logger_ref.write_log(log_location, log_prefix + "Failure - Invalid response.");
+        std::cerr << "[WARN] " << log_prefix << "Неверный ответ на 'вызов'." << std::endl;
+        std::string fail_packet = MessageProtocol::build("AUTH_FAIL", client_id, -1, "Invalid credentials");
+        ProtocolUtils::send_packet(socket, fail_packet);
+        return false;
+    }
+}
+
+
+// --- Регистрация ---
+bool AuthService::registerClient(int socket, const std::string& client_id, const std::string& client_ip) {
+    const std::string log_prefix = "[AuthService] [Register] | ClientID: " + client_id + " | IP: " + client_ip + " | ";
+    
+    // 1. Проверяем, не занят ли ID, используя тот же метод
+    if (db_ref.selectUserByName(client_id)) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - User ID already exists.");
+        std::cerr << "[WARN] " << log_prefix << "Попытка регистрации с уже существующим ID." << std::endl;
+        std::string packet = MessageProtocol::build("REG_FAIL", client_id, -1, "User ID already taken");
+        ProtocolUtils::send_packet(socket, packet);
+        return false;
+    }
+
+    // 2. Получаем пароль от клиента (логика без изменений)
+    std::string password_packet_raw = ProtocolUtils::receive_packet(socket, 1024);
+    if (password_packet_raw.empty()) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - Client disconnected before sending password.");
+        return false;
+    }
+    
+    std::string password = MessageProtocol::parse(password_packet_raw).message;
+
+    // 3. Проверяем сложность пароля
+    if (password.length() < 8) {
+        logger_ref.write_log(log_location, log_prefix + "Failure - Password is too short.");
+        std::string packet = MessageProtocol::build("REG_FAIL", client_id, -1, "Password is too short (min 8 chars)");
+        ProtocolUtils::send_packet(socket, packet);
+        return false;
+    }
+
+    // 4. Хешируем пароль
+    std::string hashed_password = CryptoUtils::generate_hash(password);
+
+    // 5. Вставляем нового пользователя в БД, используя ваш метод insertUser
+    if (db_ref.insertUser(client_id, hashed_password, client_ip)) {
+        logger_ref.write_log(log_location, log_prefix + "Success - User registered successfully.");
+        std::cout << "[INFO] " << log_prefix << "Пользователь успешно зарегистрирован." << std::endl;
+        std::string packet = MessageProtocol::build("REG_OK", client_id, -1, "Registration successful");
+        ProtocolUtils::send_packet(socket, packet);
+        return true;
+    } else {
+        // Метод insertUser уже выводит ошибку через qCritical, мы просто дублируем в наш лог
+        logger_ref.write_log(log_location, log_prefix + "Failure - Database error during user insertion.");
+        std::string packet = MessageProtocol::build("REG_FAIL", client_id, -1, "Internal server error");
+        ProtocolUtils::send_packet(socket, packet);
+        return false;
+    }
+}
+
+
+// --- Вспомогательная функция для удаления nonce ---
+void AuthService::removeChallenge(int socket) {
+    std::lock_guard<std::mutex> lock(challenges_mutex);
+    active_challenges.erase(socket);
+}
+
+================================================================================
+// Файл: Auth_reg/auth_service.h
+================================================================================
+
+// Auth_reg/auth_service.h
+#pragma once
+
+#include <string>
+#include <map>
+#include <mutex>
+
+// Подключаем ваши классы
+#include "../Base/base.h" // Класс для работы с БД
+#include "../Logger/logger.h" // Класс для логирования
+
+class AuthService {
+public:
+    // ... (конструктор и другие методы без изменений) ...
+    AuthService(base& db, logger& logger_instance, const std::string& log_path);
+
+    /**
+     * @brief Проводит аутентификацию клиента.
+     * @details Сначала вызывает selectUserByName для загрузки данных в объект БД,
+     *          а затем использует getHashedPassword для их получения.
+     */
+    bool authenticateClient(int socket, const std::string& client_id);
+
+    // ... (метод registerClient без изменений в сигнатуре) ...
+    bool registerClient(int socket, const std::string& client_id, const std::string& client_ip);
+
+private:
+    base& db_ref; // Используем ваше имя класса 'base'
+    logger& logger_ref;
+    const std::string log_location; // Путь к файлу логов
+
+    std::map<int, std::string> active_challenges;
+    std::mutex challenges_mutex;
+
+    void removeChallenge(int socket);
+};
+
+================================================================================
+// Файл: Logger/logger.cpp
+================================================================================
+
+#include "logger.h"
+int logger::write_log( std::string log_loc,  std::string message) {
+    // Проверяем, существует ли лог-файл по указанному пути
+    if (!boost::filesystem::exists(log_loc)) {
+        std::cerr << "Такого лог файла не существует: " << log_loc << std::endl;
+        throw critical_error("Не удалось открыть лог файл");
+    }
+
+    // Синхронизируем доступ к логированию
+    std::lock_guard<std::mutex> lock(mtx);
+
+    // Открываем файл для дозаписи внутри критической секции
+    std::ofstream log_file(log_loc, std::ios::app | std::ios::out);
+    if (!log_file.is_open()) {
+        std::cerr << "Не удалось открыть лог файл для записи: " << log_loc << std::endl;
+        throw critical_error("Не удалось открыть лог файл");
+    }
+
+    // Получаем текущее время и форматируем его
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::string time_str = std::ctime(&t);
+    if (!time_str.empty() && time_str.back() == '\n') {
+        time_str.pop_back();
+    }
+
+    // Записываем время и сообщение в лог-файл
+    log_file << time_str << " / " << message << '\n';
+    log_file.flush();  // сброс буфера
+    // Файл автоматически закроется по выходу из scope
+
+    return 0;
+}
+
+================================================================================
+// Файл: Logger/logger.h
+================================================================================
+
+#pragma once
+#include <vector>
+#include <string>
+#include <fstream>
+#include <iostream>
+#include <chrono>
+#include <cstring>
+#include "error.h"
+#include <mutex>
+#include <boost/filesystem.hpp>
+class logger{
+    public:
+    std::ofstream log;
+    std::mutex mtx;
+    int write_log(std::string log_loc,std::string message);
+};
+
+================================================================================
+// Файл: Protocol/protocol.cpp
+================================================================================
+
+#include "protocol.h"
+#include <random>
+#include <sstream>
+
+std::string MessageProtocol::build(const std::string& header,
+                                   const std::string& clientID,
+                                   int messageID,
+                                   const std::string& messageBody) {
+    return header + "|clientID:" + clientID +
+           "|messageID:" + std::to_string(messageID) +
+           "|message:" + messageBody+"\n";
+}
+MessageProtocol::ParsedMessage MessageProtocol::parse(const std::string& raw) {
+    std::mutex mtx;
+    mtx.lock();
+    ParsedMessage result;
+    size_t pos = 0;
+    size_t next = raw.find('|');
+
+    // Header
+    if (next == std::string::npos)
+        return result; // bad format
+    result.header = raw.substr(0, next);
+    pos = next + 1;
+
+    // Fields
+    while ((next = raw.find('|', pos)) != std::string::npos) {
+        std::string part = raw.substr(pos, next - pos);
+        if (part.rfind("clientID:", 0) == 0) {
+            result.clientID = part.substr(9);
+        } else if (part.rfind("messageID:", 0) == 0) {
+            try {
+                result.messageID = std::stoi(part.substr(10));
+            } catch (...) {
+                result.messageID = -1;
+            }
+        }
+        pos = next + 1;
+    }
+
+    // Last part (message)
+    std::string last = raw.substr(pos);
+    if (last.rfind("message:", 0) == 0) {
+        result.message = last.substr(8);
+        result.message.pop_back();
+    }
+    mtx.unlock();
+    return result;
+}
+
+int MessageProtocol::generateMessageID() {
+    static std::mt19937 gen(std::random_device{}());
+    static std::uniform_int_distribution<> dist(1, 32);
+    return dist(gen);
+}
+
+
+================================================================================
+// Файл: Protocol/protocol.h
+================================================================================
+
+#pragma once
+#include <string>
+#include <mutex>
+class MessageProtocol {
+public:
+    struct ParsedMessage {
+        std::string header;
+        std::string clientID;
+        int messageID = -1;
+        std::string message;
+    };
+
+    static std::string build(const std::string& header,
+                             const std::string& clientID,
+                             int messageID,
+                             const std::string& messageBody);
+
+    static ParsedMessage parse(const std::string& raw);
+    static int generateMessageID();
+};
+
+
+================================================================================
+// Файл: Rsa/rsa_crypto.cpp
+================================================================================
+
+#include "rsa_crypto.h"
+
+// Зависимости для реализации
+#define OPENSSL_API_COMPAT 0x10100000L
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+
+#include <stdexcept>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <fstream>
+#include <random>
+
+// --- Внутренние вспомогательные функции (скрыты от пользователя) ---
+namespace {
+
+// Преобразует BIGNUM (из OpenSSL) в наш BigInt
+BigInt bignumToBigInt(const BIGNUM* bn) {
+    char* hex_str = BN_bn2hex(bn);
+    if (!hex_str) throw std::runtime_error("BN_bn2hex failed");
+
+    std::string hex(hex_str);
+    OPENSSL_free(hex_str);
+
+    BigInt target;
+    target.limbs.clear();
+    if (hex.empty() || hex == "0") {
+        return BigInt(0);
+    }
+    
+    if (hex.size() % 16 != 0) {
+        hex.insert(0, 16 - (hex.size() % 16), '0');
+    }
+
+    for (size_t i = 0; i < hex.size(); i += 16) {
+        std::string part = hex.substr(i, 16);
+        target.limbs.insert(target.limbs.begin(), std::stoull(part, nullptr, 16));
+    }
+    target.normalize();
+    return target;
+}
+
+// Преобразует наш BigInt в BIGNUM (из OpenSSL)
+// Важно: вызывающий код должен освободить память с помощью BN_free()
+BIGNUM* bigIntToBignum(const BigInt& bi) {
+    BIGNUM* bn = nullptr;
+    std::string hex = bi.toHexString();
+    BN_hex2bn(&bn, hex.c_str());
+    return bn;
+}
+
+// Проверка на простоту с помощью OpenSSL
+bool isPrime(const BigInt& candidate, int rounds = 64) {
+    BIGNUM* bn = bigIntToBignum(candidate);
+    BN_CTX* ctx = BN_CTX_new();
+    int result = BN_is_prime_ex(bn, rounds, ctx, nullptr);
+    BN_free(bn);
+    BN_CTX_free(ctx);
+
+    if (result < 0) throw std::runtime_error("Primality test error");
+    return result == 1;
+}
+
+// Генерация кандидата в простые числа
+BigInt generatePrimeCandidate(size_t len) {
+    if (len < 2) return BigInt(0);
+    size_t limbCount = (len + 63) / 64;
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+
+    BigInt result;
+    result.limbs.resize(limbCount, 0);
+    for (size_t i = 0; i < limbCount; i++) {
+        result.limbs[i] = dis(gen);
+    }
+    
+    // Устанавливаем старший бит, чтобы число имело нужную длину
+    result.limbs.back() |= (1ULL << ((len - 1) % 64));
+    // Устанавливаем младший бит, чтобы число было нечетным
+    result.limbs[0] |= 1ULL;
+
+    result.normalize();
+    return result;
+}
+
+// Генерация простого числа
+BigInt generatePrime(size_t bitLength, int rounds) {
+    while (true) {
+        BigInt candidate = generatePrimeCandidate(bitLength);
+        if (isPrime(candidate, rounds)) {
+            return candidate;
+        }
+    }
+}
+
+} // конец анонимного пространства имен
+
+// --- Реализация методов BigInt ---
+
+BigInt::BigInt() : limbs{0} {}
+BigInt::BigInt(uint64_t value) {
+    if (value == 0) limbs.push_back(0);
+    else limbs.push_back(value);
+}
+
+void BigInt::normalize() {
+    while (limbs.size() > 1 && limbs.back() == 0) {
+        limbs.pop_back();
+    }
+}
+
+bool BigInt::isZero() const {
+    return limbs.size() == 1 && limbs[0] == 0;
+}
+
+std::string BigInt::toHexString() const {
+    if (isZero()) return "0";
+    std::ostringstream oss;
+    oss << std::hex << std::uppercase;
+    oss << limbs.back();
+    for (int i = limbs.size() - 2; i >= 0; --i) {
+        oss << std::setw(16) << std::setfill('0') << limbs[i];
+    }
+    return oss.str();
+}
+
+void BigInt::printHex(const std::string& label) const {
+    if (!label.empty()) std::cout << label;
+    std::cout << "0x" << this->toHexString() << std::dec << std::endl;
+}
+
+
+// --- Реализация методов RSAKeyPair ---
+
+RSAKeyPair::RSAKeyPair(size_t bitLength) {
+    std::cout << "🧪 Generating p..." << std::endl;
+    p = generatePrime(bitLength / 2, 64);
+    std::cout << "🧪 Generating q..." << std::endl;
+    q = generatePrime(bitLength / 2, 64);
+
+    BN_CTX* ctx = BN_CTX_new();
+    BIGNUM* bn_p = bigIntToBignum(p);
+    BIGNUM* bn_q = bigIntToBignum(q);
+    
+    // n = p * q
+    BIGNUM* bn_n = BN_new();
+    BN_mul(bn_n, bn_p, bn_q, ctx);
+    n = bignumToBigInt(bn_n);
+
+    // phi = (p-1)*(q-1)
+    BIGNUM* bn_p1 = BN_dup(bn_p);
+    BN_sub_word(bn_p1, 1);
+    BIGNUM* bn_q1 = BN_dup(bn_q);
+    BN_sub_word(bn_q1, 1);
+    BIGNUM* bn_phi = BN_new();
+    BN_mul(bn_phi, bn_p1, bn_q1, ctx);
+    phi = bignumToBigInt(bn_phi);
+
+    // e = 65537
+    e = BigInt(65537);
+    BIGNUM* bn_e = bigIntToBignum(e);
+
+    // d = e^(-1) mod phi
+    BIGNUM* bn_d = BN_mod_inverse(nullptr, bn_e, bn_phi, ctx);
+    d = bignumToBigInt(bn_d);
+
+    // Очистка
+    BN_CTX_free(ctx);
+    BN_free(bn_p); BN_free(bn_q); BN_free(bn_n);
+    BN_free(bn_p1); BN_free(bn_q1); BN_free(bn_phi);
+    BN_free(bn_e); BN_free(bn_d);
+}
+
+void RSAKeyPair::print() const {
+    p.printHex("p: ");
+    q.printHex("q: ");
+    n.printHex("n (modulus): ");
+    phi.printHex("phi: ");
+    e.printHex("e (public exponent): ");
+    d.printHex("d (private exponent): ");
+}
+
+// --- Реализация отдельных функций ---
+
+void saveKeyToFile(const std::string& filename, const BigInt& key) {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) throw std::runtime_error("Не удалось открыть файл для записи: " + filename);
+    uint64_t size = key.limbs.size();
+    out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    out.write(reinterpret_cast<const char*>(key.limbs.data()), size * sizeof(Limb));
+}
+
+BigInt loadKeyFromFile(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) throw std::runtime_error("Не удалось открыть файл для чтения: " + filename);
+    uint64_t size = 0;
+    in.read(reinterpret_cast<char*>(&size), sizeof(size));
+    if (!in || size == 0) throw std::runtime_error("Некорректный формат файла: " + filename);
+    BigInt key;
+    key.limbs.resize(size);
+    in.read(reinterpret_cast<char*>(key.limbs.data()), size * sizeof(Limb));
+    if (!in) throw std::runtime_error("Не удалось прочитать данные ключа из файла: " + filename);
+    return key;
+}
+
+std::vector<unsigned char> sha256_hash_file(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) throw std::runtime_error("Не удалось открыть файл: " + filename);
+
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (!mdctx) throw std::runtime_error("Ошибка создания контекста EVP");
+    if (1 != EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr)) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Ошибка инициализации хеширования");
+    }
+
+    const size_t bufSize = 4096;
+    std::vector<char> buffer(bufSize);
+    while (file) {
+        file.read(buffer.data(), bufSize);
+        if (file.gcount() > 0) {
+            if (1 != EVP_DigestUpdate(mdctx, buffer.data(), file.gcount())) {
+                EVP_MD_CTX_free(mdctx);
+                throw std::runtime_error("Ошибка обновления хеша");
+            }
+        }
+    }
+
+    std::vector<unsigned char> hash(EVP_MAX_MD_SIZE);
+    unsigned int hash_len = 0;
+    if (1 != EVP_DigestFinal_ex(mdctx, hash.data(), &hash_len)) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Ошибка финализации хеша");
+    }
+    hash.resize(hash_len);
+    EVP_MD_CTX_free(mdctx);
+    return hash;
+}
+
+BigInt rsa_mod_exp(const BigInt& base, const BigInt& exponent, const BigInt& modulus) {
+    BN_CTX* ctx = BN_CTX_new();
+    BIGNUM* bn_base = bigIntToBignum(base);
+    BIGNUM* bn_exp = bigIntToBignum(exponent);
+    BIGNUM* bn_mod = bigIntToBignum(modulus);
+    BIGNUM* bn_res = BN_new();
+    
+    BN_mod_exp(bn_res, bn_base, bn_exp, bn_mod, ctx);
+    
+    BigInt result = bignumToBigInt(bn_res);
+
+    BN_CTX_free(ctx);
+    BN_free(bn_base); BN_free(bn_exp); BN_free(bn_mod); BN_free(bn_res);
+    return result;
+}
+
+BigInt fromBytes(const std::vector<unsigned char>& bytes) {
+    BIGNUM* bn = BN_bin2bn(bytes.data(), bytes.size(), nullptr);
+    if (!bn) throw std::runtime_error("Ошибка конвертации байтов в BigInt");
+    BigInt result = bignumToBigInt(bn);
+    BN_free(bn);
+    return result;
+}
+std::vector<unsigned char> hexStringToBytes(const std::string& hex) {
+    // Создаем копию, чтобы не изменять оригинал, и убираем префикс "0x", если он есть
+    std::string processedHex = hex;
+    if (processedHex.rfind("0x", 0) == 0 || processedHex.rfind("0X", 0) == 0) {
+        processedHex = processedHex.substr(2);
+    }
+
+    // Проверяем, что длина строки четная. Каждый байт кодируется двумя HEX-символами.
+    if (processedHex.length() % 2 != 0) {
+        throw std::invalid_argument("Шестнадцатеричная строка должна иметь четное количество символов.");
+    }
+
+    std::vector<unsigned char> bytes;
+    // Резервируем память для повышения производительности
+    bytes.reserve(processedHex.length() / 2);
+
+    for (size_t i = 0; i < processedHex.length(); i += 2) {
+        // Берем два символа (один байт)
+        std::string byteString = processedHex.substr(i, 2);
+        try {
+            // Конвертируем два HEX-символа в число и добавляем в вектор
+            unsigned char byte = static_cast<unsigned char>(std::stoul(byteString, nullptr, 16));
+            bytes.push_back(byte);
+        } catch (const std::exception& e) {
+            throw std::invalid_argument("Строка содержит недопустимые шестнадцатеричные символы: '" + byteString + "'");
+        }
+    }
+
+    return bytes;
+}
+BigInt BigInt::fromHexString(const std::string& hexString) {
+    BIGNUM* bn = nullptr;
+    std::string processedHex = hexString;
+    // Удаляем префикс "0x" или "0X", если он есть
+    if (processedHex.rfind("0x", 0) == 0 || processedHex.rfind("0X", 0) == 0) {
+        processedHex = processedHex.substr(2);
+    }
+    
+    // Преобразуем шестнадцатеричную строку в OpenSSL BIGNUM
+    // BN_hex2bn возвращает 0 при ошибке, 1 при успехе.
+    if (!BN_hex2bn(&bn, processedHex.c_str())) {
+        if (bn) BN_free(bn); // Освобождаем, если что-то было выделено до ошибки
+        throw std::runtime_error("Failed to convert hexadecimal string to BIGNUM: " + processedHex);
+    }
+    
+    // Преобразуем OpenSSL BIGNUM в наш BigInt
+    BigInt result = bignumToBigInt(bn);
+    
+    // Освобождаем память, выделенную OpenSSL для BIGNUM
+    BN_free(bn);
+    
+    return result;
+}
+
+================================================================================
+// Файл: Rsa/rsa_crypto.h
+================================================================================
+
+#ifndef RSA_CRYPTO_H
+#define RSA_CRYPTO_H
+
+#include <string>
+#include <vector>
+#include <cstdint>
+
+// Тип для "конечностей" большого числа
+using Limb = uint64_t;
+
+/**
+ * @brief Структура для представления произвольно больших целых чисел.
+ */
+struct BigInt
+{
+    std::vector<Limb> limbs; // Хранятся в little-endian (младшая часть в начале)
+
+    // Конструкторы
+    BigInt();
+    BigInt(uint64_t value);
+
+    // Методы
+    void normalize(); // Удаляет ведущие нули
+    bool isZero() const;
+    void printHex(const std::string &label = "") const;
+    std::string toHexString() const;
+    static BigInt fromHexString(const std::string& hexString);
+};
+
+/**
+ * @brief Структура для хранения и генерации пары ключей RSA.
+ */
+struct RSAKeyPair
+{
+    BigInt p, q, n, phi, e, d;
+
+    /**
+     * @brief Генерирует новую пару ключей RSA заданной длины.
+     * @param bitLength Длина ключа в битах (например, 2048).
+     */
+    RSAKeyPair(size_t bitLength);
+
+    /**
+     * @brief Выводит все компоненты ключей в консоль.
+     */
+    void print() const;
+};
+
+// --- Отдельные функции модуля ---
+
+/**
+ * @brief Сохраняет ключ (BigInt) в бинарный файл.
+ * @param filename Имя файла.
+ * @param key Ключ для сохранения.
+ */
+void saveKeyToFile(const std::string &filename, const BigInt &key);
+
+/**
+ * @brief Загружает ключ (BigInt) из бинарного файла.
+ * @param filename Имя файла.
+ * @return Загруженный ключ типа BigInt.
+ */
+BigInt loadKeyFromFile(const std::string &filename);
+
+/**
+ * @brief Вычисляет хеш SHA-256 для указанного файла.
+ * @param filename Путь к файлу.
+ * @return Вектор байт, представляющий хеш.
+ */
+std::vector<unsigned char> sha256_hash_file(const std::string &filename);
+
+/**
+ * @brief Выполняет операцию модульного возведения в степень (основа^экспонента % модуль).
+ * Это основная операция для шифрования и подписи в RSA.
+ * @param base Основание.
+ * @param exponent Экспонента (степень).
+ * @param modulus Модуль.
+ * @return Результат операции (BigInt).
+ */
+BigInt rsa_mod_exp(const BigInt &base, const BigInt &exponent, const BigInt &modulus);
+
+/**
+ * @brief Преобразует вектор байт (например, хеш) в BigInt.
+ * @param bytes Входной вектор байт.
+ * @return Объект BigInt.
+ */
+BigInt fromBytes(const std::vector<unsigned char> &bytes);
+std::vector<unsigned char> hexStringToBytes(const std::string &hexString);
+#endif // RSA_CRYPTO_H
+
