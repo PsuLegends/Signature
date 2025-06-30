@@ -11,7 +11,7 @@
 #include "../Auth_reg/auth_service.h"
 #include "../Signing/signing_service.h"
 #include "../Error/error.h"
-
+#include "../Protocol_utils/protocol_utils.h"
 class Server {
 public:
     /**

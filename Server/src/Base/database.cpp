@@ -1,4 +1,4 @@
-#include "base.h"
+#include "database.h"
 
 base::base() {
     // Попытка подключения к базе данных "client_base.db" при создании объекта.

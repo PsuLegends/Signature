@@ -4,9 +4,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include "communicator.h"
-#include "error.h"
-#include "logger.h"
+
+#include "../Error/error.h"
+#include "../Logger/logger.h"
 namespace po = boost::program_options;
 class UI
 {

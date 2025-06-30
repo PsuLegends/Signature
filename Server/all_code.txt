@@ -2,18 +2,30 @@
 // Файл: main.cpp
 ================================================================================
 
-#include "ui.h"
-#include "communicator.h"
-#include "logger.h"
-#include "error.h"
-int main(int argc, char* argv[])
-{
-    UI interface (argc,argv);
-    communicator server (interface.get_port(),interface.get_log_loc());
-    server.work();
-    return 0;
-}
+#include "UI/ui.h" // Предполагаем, что UI остался для парсинга аргументов
+#include "Server/server.h" // Включаем новый класс Server
+#include "Error/error.h"
+#include <iostream>
 
+int main(int argc, char* argv[]) {
+    // UI теперь используется только для получения начальных параметров
+    UI interface(argc, argv);
+    uint16_t port = interface.get_port();
+    std::string log_file_path = interface.get_log_loc();
+
+    try {
+        // Создаем единственный экземпляр Сервера
+        Server server(port, log_file_path);
+        // Метод run() теперь содержит бесконечный главный цикл
+        server.run(); 
+    } catch (const std::exception& e) {
+        // Ловим любые критические исключения во время запуска
+        std::cerr << "[FATAL] Не удалось запустить сервер: " << e.what() << std::endl;
+        return 1; // Выход с кодом ошибки
+    }
+
+    return 0; // Эта точка никогда не будет достигнута для сервера, работающего бесконечно
+}
 
 ================================================================================
 // Файл: Protocol_utils/protocol_utils.cpp
@@ -399,7 +411,7 @@ private:
 // Файл: Base/database.cpp
 ================================================================================
 
-#include "base.h"
+#include "database.h"
 
 base::base() {
     // Попытка подключения к базе данных "client_base.db" при создании объекта.
@@ -515,7 +527,7 @@ void base::printQueryError(const QSqlQuery& query, const std::string& queryType)
 #include <string>
 #include <vector>
 #include <memory>
-#include "logger.h"
+#include "../Logger/logger.h"
 #include <filesystem>
 #include <QCoreApplication>
 #include <QSqlDatabase>
@@ -654,649 +666,374 @@ namespace CryptoUtils {
 }
 
 ================================================================================
-// Файл: Server/communicator.cpp
+// Файл: Server/client_handler.cpp
 ================================================================================
 
-#include "communicator.h"
+#include "client_handler.h"
+#include <iostream>
+#include <unistd.h> // для close()
+#include <arpa/inet.h> // для inet_ntop
+#include <thread> // для sleep_for
 
-int communicator::connect_to_cl(int &new_socket, sockaddr_in &out_clientAddr)
-{
-    const std::string method_name = "connect_to_cl";
+// Включаем утилиты и протокол
+#include "../Protocol_utils/protocol_utils.h"
+#include "../Protocol/protocol.h"
+#include "../Error/error.h"
 
-    // Начало прослушивания порта
-    if (listen(serverSocket, 10) != 0)
-    {
-        log.write_log(log_location, method_name + " | Ошибка при прослушивании порта");
-        throw critical_error("Сервер не встал на прослушку");
-    }
-    std::cout << "[INFO] [" << method_name << "] Ожидание подключения клиента" << std::endl;
-    log.write_log(log_location, method_name + " | Ожидание подключения клиента...");
-    addr_size = sizeof(out_clientAddr);
-    new_socket = accept(serverSocket, (struct sockaddr *)&out_clientAddr, &addr_size);
-    if (new_socket < 0)
-    {
-        log.write_log(log_location, method_name + " | Ошибка принятия соединения");
-        std::cerr << "[ERROR] [" << method_name << "] Ошибка при принятии соединения!" << std::endl;
-        return -1;
-    }
-
-    // Логируем информацию о клиенте
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(out_clientAddr.sin_addr), client_ip, INET_ADDRSTRLEN);
-    int client_port = ntohs(out_clientAddr.sin_port);
-    log.write_log(log_location, method_name + " | Подключен клиент | IP: " + std::string(client_ip) + " | Порт: " + std::to_string(client_port));
-
-    return 0;
+// --- Реализация менеджера RAII ---
+ClientConnectionManager::ClientConnectionManager(std::atomic<int>& counter)
+    : client_counter(counter) {
+    client_counter.fetch_add(1);
 }
 
-bool communicator::authentification(int client_socket, const std::string& cl_id) {
-    const std::string method_name = "perform_authentication";
-
-    // 1. Проверить, есть ли пользователь в БД
-    if (db.selectUserByName(cl_id) == 0) {
-        log.write_log(log_location, method_name + " | Клиент не найден | ID: " + cl_id);
-        send_data(client_socket, "AUTH_FAIL", cl_id, -1, "User not found");
-        return false;
-    }
-
-    // 2. Сгенерировать, сохранить и отправить "Вызов" (nonce)
-    std::string nonce = generate_random_string(16); // Генерируем nonce
-
-    { // Блок для защиты std::lock_guard
-        std::lock_guard<std::mutex> lock(challenges_mutex);
-        active_challenges[client_socket] = nonce; // Сохраняем nonce для этого сокета
-    }
-
-    if (send_data(client_socket, "CHALLENGE", "server", -1, nonce) != 0) {
-        return false; // Ошибка отправки
-    }
-
-    // 3. Получить "Ответ" от клиента
-    std::string client_response = recv_data(client_socket, "Ошибка приема ответа");
-    if (client_response.empty()) {
-        log.write_log(log_location, method_name + " | Не получен ответ от клиента | ID: " + cl_id);
-        return false;
-    }
-    
-    // 4. Проверить "Ответ"
-    std::string password_hash_from_db = db.getCurrentHashedPassword(); // Получаем хеш пароля из БД
-    std::string expected_response = hash_gen(password_hash_from_db + nonce); // Сами считаем, как должно быть
-
-    // Обязательно удаляем nonce после использования, чтобы его нельзя было использовать повторно
-    {
-        std::lock_guard<std::mutex> lock(challenges_mutex);
-        active_challenges.erase(client_socket);
-    }
-    
-    if (client_response == expected_response) {
-        // Успех!
-        send_data(client_socket, "AUTH_OK", cl_id, -1, "Authentication successful");
-        return true;
-    } else {
-        // Неудача!
-        log.write_log(log_location, method_name + " | Неверный ответ на вызов | ID: " + cl_id);
-        send_data(client_socket, "AUTH_FAIL", cl_id, -1, "Invalid response");
-        return false;
-    }
+ClientConnectionManager::~ClientConnectionManager() {
+    client_counter.fetch_sub(1);
 }
 
-int communicator::registration(int client_socket, std::string cl_id)
+
+// --- Реализация ClientHandler ---
+ClientHandler::ClientHandler(int socket, sockaddr_in addr,
+                             std::shared_ptr<AuthService> auth,
+                             std::shared_ptr<SigningService> signing,
+                             std::shared_ptr<logger> logger_instance,
+                             const std::string& log_path,
+                             std::atomic<int>& client_counter)
+    : socket_fd(socket), auth_service(auth), signing_service(signing), 
+      logger_ptr(logger_instance), log_location(log_path), 
+      connection_manager(client_counter) // Счетчик увеличивается здесь
 {
-    const std::string method_name = "registration";
-
-    // Проверка валидности сокета
-    if (client_socket < 0)
-    {
-        log.write_log(log_location, method_name + " | Некорректный сокет клиента");
-        std::cerr << "[ERROR] [" << method_name << "] Некорректный сокет клиента" << std::endl;
-        return 1;
-    }
-
-    // Генерация уникального ID сообщения
-    int msg_id = MessageProtocol::generateMessageID();
-
-    // Получаем IP клиента
-    sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-    if (getpeername(client_socket, reinterpret_cast<struct sockaddr *>(&addr), &addr_len) < 0)
-    {
-        log.write_log(log_location, method_name + " | Не удалось получить IP клиента");
-    }
-    char client_ip_cstr[INET_ADDRSTRLEN] = "";
-    inet_ntop(AF_INET, &addr.sin_addr, client_ip_cstr, INET_ADDRSTRLEN);
-    std::string client_ip_str = client_ip_cstr;
-
-    log.write_log(log_location, method_name + " | Начата регистрация клиента | ID: " + cl_id + " | IP: " + client_ip_str);
-    std::cout << "[INFO] [" << method_name << "] Регистрация клиента [" << cl_id << "] с IP " << client_ip_str << std::endl;
-
-    // Получаем пароль от клиента
-    std::string password = recv_data(client_socket, "Ошибка при приеме пароля");
-    if (password.empty())
-    {
-        log.write_log(log_location, method_name + " | Не получен пароль клиента | ID: " + cl_id + " | IP: " + client_ip_str);
-        std::cerr << "[ERROR] [" << method_name << "] Не удалось получить пароль от клиента [" << cl_id << "]" << std::endl;
-        close_sock(client_socket);
-        return 1;
-    }
-
-    // Вставляем нового пользователя в базу данных
-    if (db.insertUser(cl_id, password, client_ip_str) == false)
-    {
-        send_data(client_socket, "REG_OK", cl_id, msg_id, "Ошибка регистрации");
-        close_sock(client_socket);
-        std::cout << "[INFO] [" << method_name << "] Регистрация клиента [" << cl_id << "] не завершена, ошибка при запросе к БД" << std::endl;
-        return 1;
-    }
-
-    // Отправляем клиенту протокольное сообщение об успешной регистрации
-    send_data(client_socket, "REG_OK", cl_id, msg_id, "Регистрация успешна");
-
-    log.write_log(log_location, method_name + " | Регистрация завершена успешно | ID: " + cl_id + " | IP: " + client_ip_str);
-    std::cout << "[INFO] [" << method_name << "] Регистрация клиента [" << cl_id << "] завершена успешно" << std::endl;
-
-    // Закрываем соединение
-    close_sock(client_socket);
+    char ip_buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(addr.sin_addr), ip_buf, INET_ADDRSTRLEN);
+    this->client_ip_str = ip_buf;
 }
 
-communicator::communicator(uint port, std::string log_loc)
-{
-    p = port;
-    // base_location = base_loc;
-    log_location = log_loc;
-}
-void communicator::work()
-{
-    const std::string method_name = "work";
-    log.write_log(log_location, method_name + " | Запуск основного цикла сервера");
-    std::cout << "[INFO] [" << method_name << "] Сервер запущен и ожидает подключения клиентов..." << std::endl;
-
-    start();
-
-    while (true)
-    {
-        int new_socket;
-        sockaddr_in client_addr;
-        int result = connect_to_cl(new_socket, client_addr);
-
-        if (result != 0)
-        {
-            log.write_log(log_location, method_name + " | Ошибка при подключении клиента");
-            std::cerr << "[ERROR] [" << method_name << "] Ошибка подключения клиента, продолжаем ожидание..." << std::endl;
-            continue;
-        }
-        int prev = active_clients.fetch_add(1);
-        // Проверяем, есть ли свободный слот
-        if (prev >= 3)
-        {
-            active_clients.fetch_sub(1);
-            send_data(new_socket, "CONN_ERR", "server", -1, "Сервер полон");
-            close_sock(new_socket);
-
-            log.write_log(log_location, method_name + " | Отклонено подключение: очередь заполнена");
-            std::cout << "[INFO] [" << method_name << "] Отклонено новое подключение: очередь заполнена." << std::endl;
-            continue;
-        }
-        send_data(new_socket, "CONN_OK", "server", -1, "Подключение успешно");
-        // Логируем успешное подключение клиента и создание потока
-        log.write_log(log_location, method_name + " | Подключение клиента принято, создаётся поток для обработки");
-        std::cout << "[INFO] [" << method_name << "] Принято новое подключение. Запуск потока обработки клиента." << std::endl;
-
-        // Создаем поток
-        std::thread client_thread(&communicator::handle_client, this, new_socket, client_addr);
-        client_thread.detach();
-    }
-}
-
-void communicator::handle_client(int client_socket, sockaddr_in clientAddr)
-{
-    const std::string method_name = "handle_client";
-    // active_clients.fetch_add(1);
-    try
-    {
-        // Получаем ID клиента
-        std::string cl_id = recv_data(client_socket, method_name + " | Ошибка при приеме ID клиента");
-        std::string operation_type = recv_data(client_socket, method_name + " | Ошибка при приеме типа операции");
-
-        // Получаем IP клиента
-        char ip_buf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &(clientAddr.sin_addr), ip_buf, INET_ADDRSTRLEN);
-        std::string client_ip = ip_buf;
-
-        // Логируем подключение клиента
-        log.write_log(log_location, method_name + " | Установлено соединение с клиентом | ID: " + cl_id + " | IP: " + client_ip);
-        std::cout << "[INFO] [" << method_name << "] Подключение от клиента: ID = " << cl_id << ", IP = " << client_ip << std::endl;
-
-        // Небольшая задержка для синхронизации
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        std::cout << "[INFO] [" << method_name << "] Получен тип операции: " << operation_type << std::endl;
-        if (operation_type == "0")
-        {
-            log.write_log(log_location, method_name + " | Регистрация нового клиента | ID: " + cl_id + " | IP: " + client_ip);
-            if (registration(client_socket, cl_id) == 1)
-            {
-                active_clients.fetch_sub(1);
-                return;
-            }
-            close_sock(client_socket);
-            active_clients.fetch_sub(1);
+void ClientHandler::run() {
+    try {
+        logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Новый поток запущен для клиента " + client_ip_str);
+        
+        // 1. Получить начальную операцию (логин или регистрация)
+        std::string initial_packet = ProtocolUtils::receive_packet(socket_fd, 1024);
+        if (initial_packet.empty()) {
+            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Клиент " + client_ip_str + " отсоединился до начала операции.");
+            close(socket_fd);
             return;
         }
-        else
-        {
-            // Аутентификация клиента
-            if (authentification(client_socket, cl_id) == 0)
-            {
-                log.write_log(log_location, method_name + " | Аутентификация не пройдена | ID: " + cl_id + " | IP: " + client_ip);
-                active_clients.fetch_sub(1);
-                return;
+
+        MessageProtocol::ParsedMessage initial_msg = MessageProtocol::parse(initial_packet);
+        this->client_id_str = initial_msg.clientID;
+        const std::string operation_type = initial_msg.header; // Предполагаем, что заголовок - это тип операции
+
+        logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " запрашивает операцию: " + operation_type);
+        
+        // 2. Обработать регистрацию или аутентификацию
+        bool authenticated = false;
+        if (operation_type == "REGISTER") { // Используем более описательный заголовок
+            // Сервис регистрации получит пароль и обработает запрос
+            auth_service->registerClient(socket_fd, client_id_str, client_ip_str);
+            // Соединение закрывается после регистрации, как в вашей оригинальной логике
+        } else if (operation_type == "LOGIN") { // Заголовок для входа
+            // Сервис аутентификации выполняет весь процесс "Вызов-ответ"
+            if (auth_service->authenticateClient(socket_fd, client_id_str)) {
+                authenticated = true;
             }
-            std::cout << "[INFO] [" << method_name << "] Успешная аутентификация клиента: " << cl_id << std::endl;
-            log.write_log(log_location, method_name + " | Аутентификация пройдена | ID: " + cl_id + " | IP: " + client_ip);
+        } else {
+            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Неизвестная начальная операция: " + operation_type);
         }
-        RSAKeyPair keyPair(keyLength);
-        while (true)
-        {
-            std::string sig_op = recv_data(client_socket, "Ошибка при приеме типа операции с подписью");
-            if(sig_op==""){
-                return;
-            }
-            if (sig_op == "11")
-            {
-                std::cout << "[INFO] [" << method_name << "] Начала процесса подписи файла" << std::endl;
-                std::string hash_file = recv_data(client_socket, "Ошибка при приеме хеша файла для подписи");
-                BigInt d, n, e;
-                try
-                {
-                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
-                    d = loadKeyFromFile("private.key");
-                    n = loadKeyFromFile("public_n.key");
-                    e = loadKeyFromFile("public_e.key");
-                    std::cout << "Keys loaded from files.\n";
-                }
-                catch (const std::exception &ex)
-                {
-                    std::cerr << "Не найдены ключи , необходимо запросить новые: " << ex.what() << std::endl;
-                    send_data(client_socket, "KEY_ERR", cl_id, 1, "Не найдены персональные ключи клиента, необходимо запросить новые");
-                    close_sock(client_socket);
-                    break;
-                }
 
-                std::cout << "Received hash (HEX): " << hash_file << std::endl;
-
-                // Конвертируем полученный HEX-хеш в вектор байт
-                std::vector<unsigned char> byteVector = hexStringToBytes(hash_file);
-
-                // *ИСПРАВЛЕНИЕ:* Используем вектор байт `byteVector` для создания BigInt
-                BigInt hashInt = fromBytes(byteVector);
-                hashInt.printHex("   Hash as BigInt: ");
-
-                // 1. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
-                std::cout << "Generating signature..." << std::endl;
-                BigInt signature = rsa_mod_exp(hashInt, d, n);
-                signature.printHex("   Generated Signature (BigInt): ");
-
-                // 2. Конвертируем объект подписи BigInt в HEX-строку для отправки клиенту
-                std::string signature_hex = signature.toHexString();
-                std::cout << "   Signature to send (HEX): " << signature_hex << std::endl;
-                // 3. Отправляем сгенерированную подпись обратно клиенту
-                send_data(client_socket, "SIG_SEND", cl_id, 1, signature_hex);
-                std::cout << "Signature successfully sent to client " << cl_id << std::endl;
-                continue;
-            }
-            if (sig_op == "22")
-            {
-                std::cout << "[INFO] [" << method_name << "] Начала процесса отправки открытого ключа подписи для ее проверки" << std::endl;
-                BigInt d, n, e;
-                try
-                {
-                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
-                    d = loadKeyFromFile("private.key");
-                    n = loadKeyFromFile("public_n.key");
-                    e = loadKeyFromFile("public_e.key");
-                    std::cout << "Keys loaded from files.\n";
-                }
-                catch (const std::exception &ex)
-                {
-                    std::cerr << "Не найдены ключи, необходимо запросить новые: " << ex.what() << std::endl;
-                    send_data(client_socket, "KEY_ERR", cl_id, 1, "Не найдены ключи , необходимо запросить новые");
-                    break;
-                }
-                send_data(client_socket, "OP_KEY", cl_id, 1, n.toHexString());
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                send_data(client_socket, "EKSP", cl_id, 1, e.toHexString());
-                continue;
-            }
-            if (sig_op == "111")
-            {
-                std::cout << "[INFO] [" << method_name << "] Начала процесса подписи файла" << std::endl;
-                std::string hash_file = recv_data(client_socket, "Ошибка при приеме хеша файла для подписи");
-
-                // Сохраняем ключи. Имена файлов уникальны для клиента (cl_id)
-                saveKeyToFile("private.key", keyPair.d);
-                saveKeyToFile("public_n.key", keyPair.n);
-                saveKeyToFile("public_e.key", keyPair.e);
-
-                BigInt d, n, e;
-                try
-                {
-                    // Загружаем ключи (в реальном приложении можно было бы использовать прямо из keyPair)
-                    d = loadKeyFromFile("private.key");
-                    n = loadKeyFromFile("public_n.key");
-                    e = loadKeyFromFile("public_e.key");
-                    std::cout << "Keys loaded from files.\n";
-                }
-                catch (const std::exception &ex)
-                {
-                    std::cerr << "Не найдены ключи , необходимо запросить новые: " << ex.what() << std::endl;
-                    send_data(client_socket, "KEY_ERR", cl_id, 1, "Не найдены ключи , необходимо запросить новые");
-                    break;
-                }
-
-                std::cout << "Received hash (HEX): " << hash_file << std::endl;
-
-                // Конвертируем полученный HEX-хеш в вектор байт
-                std::vector<unsigned char> byteVector = hexStringToBytes(hash_file);
-
-                // *ИСПРАВЛЕНИЕ:* Используем вектор байт `byteVector` для создания BigInt
-                BigInt hashInt = fromBytes(byteVector);
-                hashInt.printHex("   Hash as BigInt: ");
-
-                // 1. Создаем подпись (шифруем хеш с помощью закрытого ключа d и модуля n)
-                std::cout << "Generating signature..." << std::endl;
-                BigInt signature = rsa_mod_exp(hashInt, d, n);
-                signature.printHex("   Generated Signature (BigInt): ");
-                // 2. Конвертируем объект подписи BigInt в HEX-строку для отправки клиенту
-                std::string signature_hex = signature.toHexString();
-                std::cout << "   Signature to send (HEX): " << signature_hex << std::endl;
-                // 3. Отправляем сгенерированную подпись обратно клиенту
-                send_data(client_socket, "SIG_SEND", cl_id, 1, signature_hex);
-                std::cout << "Signature successfully sent to client " << cl_id << std::endl;
-                continue;
-            }
-            if(sig_op == "0"){
-                close_sock(client_socket);
-                return;
-            }
+        // 3. Если аутентифицирован, войти в цикл обработки запросов
+        if (authenticated) {
+            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " аутентифицирован. Обработка запросов...");
+            processRequests();
         }
-        active_clients.fetch_sub(1);
-    }
-    catch (const std::exception &e)
-    {
-        send_data(client_socket, "KEY_ERR", cl_id, 1, "Ошибка: "+std::string(e.what()));
-        // Логируем и выводим ошибку при исключении
-        log.write_log(log_location, method_name + " | Критическая ошибка обработки клиента: " + std::string(e.what()));
-        std::cerr << "[ERROR] [" << method_name << "] Исключение при обработке клиента: " << e.what() << std::endl;
-        active_clients.fetch_sub(1);
-        close_sock(client_socket);
-    }
-}
-void communicator::start()
-{
-    const std::string method_name = "start";
 
-    // Создание сокета для сервера
-    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket < 0)
-    {
-        log.write_log(log_location, method_name + " | Ошибка при создании сокета");
-        std::cerr << "[ERROR] [" << method_name << "] Ошибка при создании сокета" << std::endl;
-        throw critical_error("Сокет не был создан");
+    } catch (const std::exception& e) {
+        logger_ptr->write_log(log_location, "[ERROR] [ClientHandler] Исключение в потоке клиента " + client_ip_str + ": " + e.what());
     }
 
-    // Логируем успешное создание сокета
-    log.write_log(log_location, method_name + " | Сокет для сервера создан");
-    std::cout << "[INFO] [" << method_name << "] Сокет создан" << std::endl;
-
-    // Настройка структуры адреса для привязки
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(p);          // Устанавливаем порт
-    serverAddr.sin_addr.s_addr = INADDR_ANY; // Принимаем соединения с любого IP
-
-    // Привязка сокета к адресу
-    if (bind(serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
-    {
-        log.write_log(log_location, method_name + " | Ошибка при привязке сокета");
-        std::cerr << "[ERROR] [" << method_name << "] Ошибка при привязке сокета" << std::endl;
-        throw critical_error("Сокет не был привязан");
-    }
-
-    // Логируем успешную привязку сокета
-    log.write_log(log_location, method_name + " | Сокет привязан");
-    std::cout << "[INFO] [" << method_name << "] Сокет привязан" << std::endl;
+    // 4. Закрыть сокет в конце жизненного цикла клиента
+    logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Закрытие соединения для клиента " + client_ip_str);
+    close(socket_fd);
+    // Счетчик клиентов будет автоматически уменьшен, когда объект уничтожится (благодаря RAII)
 }
 
-std::string communicator::recv_data(int client_socket, std::string error_msg)
-{
-    const std::string method_name = "recv_data";
-
-    // Устанавливаем таймаут на приём данных
-    /*timeout.tv_sec = 100;
-    timeout.tv_usec = 0;
-    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));*/
-
-    std::vector<char> buffer(buflen);
-    int received_bytes = recv(client_socket, buffer.data(), buflen, MSG_NOSIGNAL);
-
-    if (received_bytes <= 0)
-    {
-        close_sock(client_socket);
-        log.write_log(log_location, method_name + " | Ошибка или закрыто соединение: " + error_msg);
-        std::cerr << "[ERROR] [" << method_name << "] " << error_msg << std::endl;
-        return "";
-    }
-
-    try
-    {
-        std::string raw_data(buffer.data(), received_bytes);
-        log.write_log(log_location, method_name + " | Принято протокольное сообщение от клиента (ID: " + std::to_string(client_socket) + "): " + raw_data);
-        MessageProtocol::ParsedMessage message = MessageProtocol::parse(raw_data);
-        std::cout << "[INFO] [" << method_name << "] Принято сообщение: " << message.message << std::endl;
-        return message.message; // Возвращаем только полезную нагрузку
-    }
-    catch (const std::exception &e)
-    {
-        log.write_log(log_location, method_name + " | Ошибка парсинга протокольного сообщения: " + std::string(e.what()));
-        std::cerr << "[ERROR] [" << method_name << "] Ошибка парсинга: " << e.what() << std::endl;
-        return "";
-    }
-}
-int communicator::send_data(int client_socket, const std::string &header,
-                            const std::string &client_id, int message_id,
-                            const std::string &msg)
-{
-    const std::string method_name = "send_data";
-
-    if (client_socket < 0)
-    {
-        log.write_log(log_location, method_name + " | Некорректный сокет клиента");
-        std::cerr << "[ERROR] [" << method_name << "] Некорректный сокет клиента" << std::endl;
-        return 1;
-    }
-
-    log.write_log(log_location, method_name + " | Подготовка отправки данных клиенту (ID: " + std::to_string(client_socket) + ")");
-    std::cout << "[INFO] [" << method_name << "] Подготовка отправки данных клиенту (ID: " << client_socket << ")" << std::endl;
-
-    // 1) формируем основной пакет с полезной нагрузкой
-    std::string packet = MessageProtocol::build(header, client_id, message_id, msg);
-
-    // 2) формируем пакет LENGTH по протоколу, содержащий длину payload
-    std::string len_payload = std::to_string(packet.size());
-    std::string len_packet = MessageProtocol::build("LENGTH", client_id, message_id, len_payload);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    // отправляем пакет LENGTH целиком
-    size_t sent = 0;
-    const char *len_data = len_packet.data();
-    size_t len_size = len_packet.size();
-    while (sent < len_size)
-    {
-        int n = send(client_socket, len_data + sent, len_size - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-        {
-            log.write_log(log_location, method_name + " | Ошибка отправки LENGTH" + std::to_string(sent) + " байт");
-            std::cerr << "[ERROR] [" << method_name << "] Ошибка отправки LENGTH, n=" << n << std::endl;
-            // close_sock(client_socket);
-            return 1;
+void ClientHandler::processRequests() {
+    while (true) {
+        std::string packet_raw = ProtocolUtils::receive_packet(socket_fd, 1024);
+        if (packet_raw.empty()) {
+            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " отсоединился.");
+            break;
         }
-        sent += n;
-    }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        MessageProtocol::ParsedMessage request = MessageProtocol::parse(packet_raw);
+        const std::string& sig_op = request.header;
 
-    // 3) отправляем основной пакет целиком
-    sent = 0;
-    const char *data = packet.data();
-    size_t packet_size = packet.size();
-    while (sent < packet_size)
-    {
-        int n = send(client_socket, data + sent, packet_size - sent, 0);
-        if (n <= 0)
-        {
-            log.write_log(log_location, method_name + " | Ошибка отправки DATA после " + std::to_string(sent) + " байт");
-            std::cerr << "[ERROR] [" << method_name << "] Ошибка отправки DATA, n=" << n << std::endl;
-            // close_sock(client_socket);
-            return 1;
+        if (sig_op == "SIGN_HASH") { // Замена для "11"
+            handleSignOperation();
+        } else if (sig_op == "GET_PUB_KEY") { // Замена для "22"
+            handleGetPublicKeyOperation();
+        } else if (sig_op == "LOGOUT") { // Замена для "0"
+            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " запросил отключение.");
+            break;
+        } else {
+            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Неизвестная операция подписи '" + sig_op + "' от " + client_id_str);
+            ProtocolUtils::send_formatted_message(socket_fd, "OP_UNKNOWN", client_id_str, -1, "Неизвестная операция.");
         }
-        sent += n;
     }
-
-    log.write_log(log_location, method_name + " | Успешно отправлено пакетов LENGTH и " + header + " клиенту (ID: " + std::to_string(client_socket) + ")");
-    std::cout << "[INFO] [" << method_name << "] Успешно отправлено пакетов LENGTH и " << header << " клиенту (ID: " << client_socket << ")" << std::endl;
 }
 
-void communicator::close_sock(int client_socket)
-{
-    const std::string method_name = "close_sock";
-
-    // Логируем разрыв соединения
-    log.write_log(log_location, method_name + " | Разорвано соединение с клиентом (ID: " + std::to_string(client_socket) + ")");
-    std::cout << "[INFO] [" << method_name << "] Разорвано соединение с клиентом (ID: " << client_socket << ")" << std::endl;
-    close(client_socket);
-
-    // Дополнительно, если нужно записывать дату и время разрыва соединения
-    std::time_t now = std::time(nullptr);
-    char timestamp[100];
-    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-    log.write_log(log_location, method_name + " | Время разрыва соединения: " + timestamp);
-}
-
-std::string communicator::hash_gen(std::string &password)
-{
-    // Создаем объект для алгоритма хэширования SHA256
-    CryptoPP::SHA256 hash;
-    std::string hashed_password;
-
-    // Применяем хэширование:
-    // StringSource - источник данных (строка с паролем), передаем его в хэш-фильтр
-    // HashFilter - фильтрует и хэширует данные через алгоритм SHA256
-    // HexEncoder - кодирует результат хэширования в строку в формате шестнадцатеричных символов
-    // StringSink - принимает результат в виде строки
-    CryptoPP::StringSource(password, true,
-                           new CryptoPP::HashFilter(hash,
-                                                    new CryptoPP::HexEncoder(
-                                                        new CryptoPP::StringSink(hashed_password))));
-
-    // Возвращаем хэшированную строку пароля
-    return hashed_password;
-}
-std::string communicator::generate_random_string(size_t byte_length) {
-    // 1. Создаем объект криптографически стойкого генератора случайных чисел.
-    //    AutoSeededRandomPool автоматически собирает энтропию из различных
-    //    источников операционной системы (движения мыши, сетевая активность и т.д.).
-    CryptoPP::AutoSeededRandomPool prng;
-
-    // 2. Создаем массив байт для хранения случайных данных.
-    CryptoPP::SecByteBlock random_bytes(byte_length);
+void ClientHandler::handleSignOperation() {
+    logger_ptr->write_log(log_location, "[INFO] [ClientHandler] " + client_id_str + " запрашивает подпись хеша.");
+    std::string hash_to_sign = ProtocolUtils::receive_packet(socket_fd, 1024); // Предполагаем, что хеш приходит в отдельном пакете
+    if(hash_to_sign.empty()){
+        return;
+    }
     
-    // 3. Заполняем массив случайными данными из генератора.
-    prng.GenerateBlock(random_bytes, random_bytes.size());
+    try {
+        std::string signature = signing_service->signHash(hash_to_sign);
+        ProtocolUtils::send_formatted_message(socket_fd, "SIGN_SUCCESS", client_id_str, -1, signature);
+    } catch (const SigningServiceError& e) {
+        logger_ptr->write_log(log_location, "[ERROR] [ClientHandler] Ошибка подписи для " + client_id_str + ": " + e.what());
+        ProtocolUtils::send_formatted_message(socket_fd, "SIGN_FAIL", client_id_str, -1, e.what());
+    }
+}
 
-    // 4. Кодируем сырые байты в шестнадцатеричную строку (hex) для удобной
-    //    передачи по сети и использования.
-    std::string hex_encoded_string;
-    CryptoPP::StringSource(random_bytes, random_bytes.size(), true,
-        new CryptoPP::HexEncoder(
-            new CryptoPP::StringSink(hex_encoded_string)
-        ) // HexEncoder
-    ); // StringSource
+void ClientHandler::handleGetPublicKeyOperation() {
+    logger_ptr->write_log(log_location, "[INFO] [ClientHandler] " + client_id_str + " запрашивает публичный ключ.");
+    try {
+        std::string n_hex = signing_service->getPublicKeyN_Hex();
+        std::string e_hex = signing_service->getPublicKeyE_Hex();
 
-    return hex_encoded_string;
+        // Отправляем части ключа в раздельных сообщениях
+        ProtocolUtils::send_formatted_message(socket_fd, "PUB_KEY_N", client_id_str, -1, n_hex);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20)); // Пауза для надежности
+        ProtocolUtils::send_formatted_message(socket_fd, "PUB_KEY_E", client_id_str, -1, e_hex);
+        
+    } catch (const SigningServiceError& e) {
+        logger_ptr->write_log(log_location, "[ERROR] [ClientHandler] Ошибка получения публичного ключа для " + client_id_str + ": " + e.what());
+        ProtocolUtils::send_formatted_message(socket_fd, "KEY_FAIL", client_id_str, -1, e.what());
+    }
 }
 
 ================================================================================
-// Файл: Server/communicator.h
+// Файл: Server/client_handler.h
 ================================================================================
 
 #pragma once
-#include <iostream>
+
 #include <string>
-#include <vector>
-#include <cstring>
-#include <algorithm>
 #include <memory>
-#include <stdlib.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <atomic>
-#include <random>
-#include <chrono>
-#include <thread>
-#include <limits>
-#include "logger.h"
-#include "error.h"
-#include "data_handler.h"
-#include <cryptopp/cryptlib.h>
-#include <cryptopp/hex.h>
-#include <cryptopp/files.h>
-#include <cryptopp/sha.h>
-#include <cryptopp/filters.h>
-#include <cryptopp/osrng.h>
-#include "base.h"
-#include "protocol.h"
-#include "rsa_crypto.h"
-class communicator
-{
-private:
-    const size_t keyLength = 2048;
-    base db;
-    struct sockaddr_in serverAddr, clientAddr;
-    socklen_t addr_size;
-    std::string base_location;
-    size_t buflen = 65536;
-    std::unique_ptr<char[]> buffer{new char[buflen]};
-    uint p;
-    std::string digits[16] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"};
+#include <netinet/in.h>
 
+// Зависимости от сервисов, которые будут использоваться
+#include "../Auth_reg/auth_service.h"
+#include "../Signing/signing_service.h"
+#include "../Logger/logger.h"
+
+// Класс для управления жизненным циклом счетчика клиентов (RAII)
+class ClientConnectionManager {
 public:
-    int serverSocket;
-    logger log;
-    std::string cl_id, log_location;
-    timeval timeout{};
-    std::atomic<int> active_clients{0};
-    communicator(uint port, std::string log_loc);
-
-    int connect_to_cl(int &new_socket, sockaddr_in &out_clientAddr);
-    int send_data(int client_socket, const std::string &header, const std::string &client_id, int message_id, const std::string &msg);
-    std::string recv_data(int client_socket, std::string messg);
-    void close_sock(int sock);
-    void work();
-    void start();
-    int send_file_list(int client_socket);
-    int send_file(int client_socket, std::string &file_path);
-    int file_exchange(int client_socket);
-    //int authentification(int client_socket, std::string cl_id);
-    int registration(int client_socket, std::string cl_id);
-    void handle_client(int client_socket, sockaddr_in clientAddr);
-    void do_operation(std::string op);
-    std::string hash_gen(std::string &password);
-    std::map<int, std::string> active_challenges;
-    std::mutex challenges_mutex; 
-    bool authentification(int client_socket, const std::string& cl_id);
-    std::string generate_random_string(size_t length);
+    explicit ClientConnectionManager(std::atomic<int>& counter);
+    ~ClientConnectionManager();
+private:
+    std::atomic<int>& client_counter;
 };
 
+
+class ClientHandler {
+public:
+    ClientHandler(int socket, sockaddr_in addr,
+                  std::shared_ptr<AuthService> auth,
+                  std::shared_ptr<SigningService> signing,
+                  std::shared_ptr<logger> logger_instance,
+                  const std::string& log_path,
+                  std::atomic<int>& client_counter);
+
+    // Точка входа, которая будет выполняться в новом потоке
+    void run();
+
+private:
+    // Основная логика обработки
+    void processRequests();
+
+    // Методы для обработки конкретных операций
+    void handleSignOperation();
+    void handleGetPublicKeyOperation();
+
+    int socket_fd;
+    std::string client_ip_str;
+    std::string client_id_str;
+    std::string log_location;
+    
+    // Указатели на общие сервисы
+    std::shared_ptr<AuthService> auth_service;
+    std::shared_ptr<SigningService> signing_service;
+    std::shared_ptr<logger> logger_ptr;
+    
+    // Менеджер соединения, использующий RAII
+    ClientConnectionManager connection_manager;
+};
+
+================================================================================
+// Файл: Server/server.cpp
+================================================================================
+
+#include "server.h"
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <thread>
+#include "client_handler.h" // Важно
+
+Server::Server(uint16_t port, const std::string& log_path)
+    : port(port), log_location(log_path)
+{
+    try {
+        // Инициализация сервисов (Внедрение зависимостей)
+        logger_ptr = std::make_shared<logger>();
+        logger_ptr->write_log(log_location, "[INFO] [Server] Инициализация сервера...");
+        
+        db_ptr = std::make_shared<base>(); // Конструктор 'base' уже выполняет подключение
+        
+        auth_service_ptr = std::make_shared<AuthService>(*db_ptr, *logger_ptr, log_location);
+        
+        // Пути к ключам должны приходить из конфига, пока задаем их здесь
+        signing_service_ptr = std::make_shared<SigningService>("private.key", "public_n.key", "public_e.key");
+
+        logger_ptr->write_log(log_location, "[INFO] [Server] Все сервисы успешно инициализированы.");
+    } catch (const std::exception& e) {
+        if(logger_ptr) {
+            logger_ptr->write_log(log_location, std::string("[CRITICAL] [Server] Ошибка инициализации: ") + e.what());
+        }
+        std::cerr << "[CRITICAL] [Server] Ошибка инициализации: " << e.what() << std::endl;
+        throw; // Перебрасываем исключение, чтобы завершить программу
+    }
+}
+
+void Server::run() {
+    setup();
+    acceptLoop();
+}
+
+void Server::setup() {
+    logger_ptr->write_log(log_location, "[INFO] [Server] Настройка сокета...");
+    server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket_fd < 0) {
+        throw critical_error("Ошибка при создании сокета сервера.");
+    }
+
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(port);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_socket_fd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        throw critical_error("Ошибка bind() для порта " + std::to_string(port));
+    }
+
+    if (listen(server_socket_fd, 10) != 0) {
+        throw critical_error("Ошибка listen()");
+    }
+    
+    logger_ptr->write_log(log_location, "[INFO] [Server] Сервер слушает порт " + std::to_string(port));
+    std::cout << "[INFO] [Server] Сервер слушает порт " << std::to_string(port) << std::endl;
+}
+
+void Server::acceptLoop() {
+    logger_ptr->write_log(log_location, "[INFO] [Server] Вход в цикл принятия соединений...");
+    while (true) {
+        sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_socket = accept(server_socket_fd, (struct sockaddr*)&client_addr, &client_len);
+
+        if (client_socket < 0) {
+            logger_ptr->write_log(log_location, "[ERROR] [Server] accept() завершился с ошибкой.");
+            continue; // Продолжаем ждать соединения
+        }
+
+        // Проверка лимита клиентов
+        if (active_clients >= MAX_CLIENTS) {
+            logger_ptr->write_log(log_location, "[WARN] [Server] Достигнут лимит клиентов. Новое соединение отклонено.");
+            ProtocolUtils::send_formatted_message(client_socket, "CONN_REJECT", "server", -1, "Сервер занят. Попробуйте позже.");
+            close(client_socket);
+            continue;
+        }
+
+        // Логика успешного соединения
+        logger_ptr->write_log(log_location, "[INFO] [Server] Соединение принято. Создание потока для клиента.");
+        ProtocolUtils::send_formatted_message(client_socket, "CONN_ACCEPT", "server", -1, "Соединение успешно.");
+        
+        // Создаем и запускаем ClientHandler в новом потоке
+        // Используем make_shared для управления памятью обработчика
+        auto handler = std::make_shared<ClientHandler>(client_socket, client_addr, 
+                                                       auth_service_ptr, signing_service_ptr, 
+                                                       logger_ptr, log_location, active_clients);
+
+        std::thread client_thread([handler]() {
+            handler->run();
+        });
+        
+        client_thread.detach(); // Позволяем потоку выполняться независимо (отсоединяем его)
+    }
+}
+
+================================================================================
+// Файл: Server/server.h
+================================================================================
+
+#pragma once
+
+#include <string>
+#include <atomic>
+#include <memory>
+#include <netinet/in.h> // Для sockaddr_in
+
+// Зависимости от новых модулей-сервисов
+#include "../Logger/logger.h"
+#include "../Base/database.h" // Используем ваше имя класса 'base'
+#include "../Auth_reg/auth_service.h"
+#include "../Signing/signing_service.h"
+#include "../Error/error.h"
+
+class Server {
+public:
+    /**
+     * @brief Конструктор сервера.
+     * @param port Порт, на котором сервер будет слушать.
+     * @param log_path Путь к лог-файлу.
+     */
+    Server(uint16_t port, const std::string& log_path);
+
+    /**
+     * @brief Запускает сервер и входит в цикл принятия соединений.
+     */
+    void run();
+
+private:
+    /**
+     * @brief Выполняет начальную настройку сокета (socket, bind, listen).
+     */
+    void setup();
+
+    /**
+     * @brief Главный цикл, принимающий новые клиентские соединения.
+     */
+    void acceptLoop();
+
+    // Конфигурация и состояние сервера
+    uint16_t port;
+    int server_socket_fd = -1;
+    std::string log_location;
+    std::atomic<int> active_clients{0};
+    const int MAX_CLIENTS = 3; // Лимит одновременных клиентов
+
+    // Общие сервисы, которые будут "внедряться" в обработчики клиентов
+    std::shared_ptr<logger> logger_ptr;
+    std::shared_ptr<base> db_ptr;
+    std::shared_ptr<AuthService> auth_service_ptr;
+    std::shared_ptr<SigningService> signing_service_ptr;
+};
 
 ================================================================================
 // Файл: UI/ui.cpp
@@ -1577,7 +1314,7 @@ void AuthService::removeChallenge(int socket) {
 #include <mutex>
 
 // Подключаем ваши классы
-#include "../Base/base.h" // Класс для работы с БД
+#include "../Base/database.h" // Класс для работы с БД
 #include "../Logger/logger.h" // Класс для логирования
 
 class AuthService {

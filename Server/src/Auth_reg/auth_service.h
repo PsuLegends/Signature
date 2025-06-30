@@ -6,7 +6,7 @@
 #include <mutex>
 
 // Подключаем ваши классы
-#include "../Base/base.h" // Класс для работы с БД
+#include "../Base/database.h" // Класс для работы с БД
 #include "../Logger/logger.h" // Класс для логирования
 
 class AuthService {

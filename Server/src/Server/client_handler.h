@@ -35,11 +35,11 @@ public:
 private:
     // Основная логика обработки
     void processRequests();
-
+    std::string receive_buffer;
     // Методы для обработки конкретных операций
     void handleSignOperation();
     void handleGetPublicKeyOperation();
-
+    std::string receive_one_message();
     int socket_fd;
     std::string client_ip_str;
     std::string client_id_str;

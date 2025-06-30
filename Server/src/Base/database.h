@@ -2,7 +2,7 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include "logger.h"
+#include "../Logger/logger.h"
 #include <filesystem>
 #include <QCoreApplication>
 #include <QSqlDatabase>
