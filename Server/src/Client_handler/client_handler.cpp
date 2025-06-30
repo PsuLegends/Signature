@@ -38,62 +38,90 @@ ClientHandler::ClientHandler(int socket, sockaddr_in addr,
 
 void ClientHandler::run() {
     try {
+        // Логируем, что для нового клиента был запущен выделенный поток
         logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Новый поток запущен для клиента " + client_ip_str);
-        
-        // 1. Получить начальную операцию (логин или регистрация)
-        std::string initial_packet = ProtocolUtils::receive_packet(socket_fd, 1024);
-        if (initial_packet.empty()) {
-            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Клиент " + client_ip_str + " отсоединился до начала операции.");
+
+        // --- ШАГ 0: ПРИВЕТСТВИЕ КЛИЕНТА (ИСПРАВЛЕНИЕ DEADLOCK'А) ---
+        // Первым делом мы отправляем клиенту подтверждение, что соединение принято.
+        // Теперь клиент знает, что можно начинать общение.
+        if (ProtocolUtils::send_formatted_message(socket_fd, "CONN_ACCEPT", "server", -1, "Соединение успешно установлено.") != 0) {
+            // Если мы не можем даже отправить приветствие, продолжать нет смысла.
+            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Не удалось отправить приветствие клиенту " + client_ip_str + ". Закрытие соединения.");
             close(socket_fd);
             return;
         }
 
-        MessageProtocol::ParsedMessage initial_msg = MessageProtocol::parse(initial_packet);
-        this->client_id_str = initial_msg.clientID;
-        const std::string operation_type = initial_msg.header; // Предполагаем, что заголовок - это тип операции
-
-        logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " запрашивает операцию: " + operation_type);
-        
-        // 2. Обработать регистрацию или аутентификацию
-        bool authenticated = false;
-        if (operation_type == "REGISTER") { // Используем более описательный заголовок
-            // Сервис регистрации получит пароль и обработает запрос
-            auth_service->registerClient(socket_fd, client_id_str, client_ip_str);
-            // Соединение закрывается после регистрации, как в вашей оригинальной логике
-        } else if (operation_type == "LOGIN") { // Заголовок для входа
-            // Сервис аутентификации выполняет весь процесс "Вызов-ответ"
-            if (auth_service->authenticateClient(socket_fd, client_id_str)) {
-                authenticated = true;
-            }
-        } else {
-            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Неизвестная начальная операция: " + operation_type);
+        // --- ШАГ 1: ПОЛУЧЕНИЕ НАЧАЛЬНОЙ ОПЕРАЦИИ ОТ КЛИЕНТА ---
+        // Теперь, когда клиент получил наше приветствие, он отправит свой запрос.
+        auto initial_msg_opt = ProtocolUtils::receive_and_parse_message(socket_fd);
+        if (!initial_msg_opt) {
+            // Если клиент отключается сразу после приветствия, это нормально. Просто логируем и выходим.
+            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_ip_str + " отсоединился до начала операции.");
+            close(socket_fd);
+            return;
         }
 
-        // 3. Если аутентифицирован, войти в цикл обработки запросов
+        // Распарсим полученное сообщение
+        MessageProtocol::ParsedMessage initial_msg = *initial_msg_opt;
+        this->client_id_str = initial_msg.clientID; // Сохраняем ID клиента для дальнейшего использования
+        const std::string operation_type = initial_msg.header; // Тип операции (LOGIN или REGISTER)
+
+        logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " (" + client_ip_str + ") запрашивает операцию: " + operation_type);
+        
+        // --- ШАГ 2: ОБРАБОТКА РЕГИСТРАЦИИ ИЛИ АУТЕНТИФИКАЦИИ ---
+        bool authenticated = false;
+        if (operation_type == "REGISTER") {
+            // Передаем управление сервису регистрации.
+            // Соединение, как правило, закрывается после регистрации.
+            auth_service->registerClient(socket_fd, client_id_str, client_ip_str);
+        
+        } else if (operation_type == "LOGIN") {
+            // Передаем управление сервису аутентификации.
+            if (auth_service->authenticateClient(socket_fd, client_id_str)) {
+                authenticated = true; // Если аутентификация успешна, устанавливаем флаг
+            }
+
+        } else {
+            logger_ptr->write_log(log_location, "[WARN] [ClientHandler] Неизвестная начальная операция: " + operation_type + " от клиента " + client_id_str);
+            ProtocolUtils::send_formatted_message(socket_fd, "OP_UNKNOWN", client_id_str, -1, "Неизвестная начальная операция.");
+        }
+
+        // --- ШАГ 3: ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ ЗАПРОСОВ (ЕСЛИ АУТЕНТИФИЦИРОВАН) ---
         if (authenticated) {
-            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " аутентифицирован. Обработка запросов...");
+            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " аутентифицирован. Переход в режим обработки запросов.");
             processRequests();
         }
 
     } catch (const std::exception& e) {
-        logger_ptr->write_log(log_location, "[ERROR] [ClientHandler] Исключение в потоке клиента " + client_ip_str + ": " + e.what());
+        // Отлов любых непредвиденных исключений в потоке для предотвращения падения сервера
+        logger_ptr->write_log(log_location, "[ERROR] [ClientHandler] Критическое исключение в потоке клиента " + client_id_str + " (" + client_ip_str + "): " + e.what());
     }
 
-    // 4. Закрыть сокет в конце жизненного цикла клиента
-    logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Закрытие соединения для клиента " + client_ip_str);
+    // --- ШАГ 4: ЗАВЕРШЕНИЕ РАБОТЫ И ОЧИСТКА ---
+    // Эта точка достигается либо после штатного завершения (выход, регистрация), либо из-за ошибки.
+    // Сокет будет закрыт в любом случае.
+    logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Закрытие соединения и завершение потока для клиента " + client_id_str + " (" + client_ip_str + ").");
     close(socket_fd);
-    // Счетчик клиентов будет автоматически уменьшен, когда объект уничтожится (благодаря RAII)
+    
+    // Деструктор ClientConnectionManager будет вызван автоматически при выходе из функции,
+    // и счетчик активных клиентов уменьшится (принцип RAII).
 }
+
 
 void ClientHandler::processRequests() {
     while (true) {
-        std::string packet_raw = ProtocolUtils::receive_packet(socket_fd, 1024);
+        /*std::string packet_raw = ProtocolUtils::receive_packet(socket_fd, 1024);
         if (packet_raw.empty()) {
             logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " отсоединился.");
             break;
-        }
+        }*/
 
-        MessageProtocol::ParsedMessage request = MessageProtocol::parse(packet_raw);
+        auto request_opt = ProtocolUtils::receive_and_parse_message(socket_fd);
+        if (!request_opt) {
+            logger_ptr->write_log(log_location, "[INFO] [ClientHandler] Клиент " + client_id_str + " отсоединился.");
+            break;
+        }
+        MessageProtocol::ParsedMessage request = *request_opt;
         const std::string& sig_op = request.header;
 
         if (sig_op == "SIGN_HASH") { // Замена для "11"
@@ -112,7 +140,13 @@ void ClientHandler::processRequests() {
 
 void ClientHandler::handleSignOperation() {
     logger_ptr->write_log(log_location, "[INFO] [ClientHandler] " + client_id_str + " запрашивает подпись хеша.");
-    std::string hash_to_sign = ProtocolUtils::receive_packet(socket_fd, 1024); // Предполагаем, что хеш приходит в отдельном пакете
+    auto hash_msg_opt = ProtocolUtils::receive_and_parse_message(socket_fd);
+    if (!hash_msg_opt) {
+        logger_ptr->write_log(log_location, "[WARN] [ClientHandler] " + client_id_str + " отсоединился перед отправкой хеша.");
+        return;
+    }
+    // Предполагаем, что хеш находится в поле 'message'
+    std::string hash_to_sign = hash_msg_opt->message;
     if(hash_to_sign.empty()){
         return;
     }

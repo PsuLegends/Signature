@@ -2,7 +2,7 @@
 
 #include <string>
 #include "../Protocol/protocol.h" // Нужен для MessageProtocol::build/parse
-
+#include <optional>
 /**
  * @brief Пространство имен для утилит, связанных с низкоуровневой передачей данных по протоколу.
  */
@@ -39,6 +39,6 @@ namespace ProtocolUtils {
      * Сначала принимает и парсит пакет с длиной, а затем принимает основной пакет.
      * @return Распарсированная полезная нагрузка (message). Пустая строка при ошибке.
      */
-    std::string receive_formatted_message(int socket, size_t buffer_size);
+    std::optional<MessageProtocol::ParsedMessage> receive_and_parse_message(int socket, size_t buffer_size = 4096);
 
 } // namespace ProtocolUtils

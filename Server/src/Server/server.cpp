@@ -69,23 +69,22 @@ void Server::acceptLoop() {
 
         if (client_socket < 0) {
             logger_ptr->write_log(log_location, "[ERROR] [Server] accept() завершился с ошибкой.");
-            continue; // Продолжаем ждать соединения
+            continue; 
         }
 
         // Проверка лимита клиентов
         if (active_clients >= MAX_CLIENTS) {
             logger_ptr->write_log(log_location, "[WARN] [Server] Достигнут лимит клиентов. Новое соединение отклонено.");
+            // Отправим отказ и закроем. Это единственное сообщение, которое здесь уместно.
             ProtocolUtils::send_formatted_message(client_socket, "CONN_REJECT", "server", -1, "Сервер занят. Попробуйте позже.");
             close(client_socket);
             continue;
         }
 
-        // Логика успешного соединения
-        logger_ptr->write_log(log_location, "[INFO] [Server] Соединение принято. Создание потока для клиента.");
-        ProtocolUtils::send_formatted_message(client_socket, "CONN_ACCEPT", "server", -1, "Соединение успешно.");
+        // Логику успешного соединения переносим в ClientHandler
+        // Больше не отправляем "CONN_ACCEPT" и не логируем здесь
         
         // Создаем и запускаем ClientHandler в новом потоке
-        // Используем make_shared для управления памятью обработчика
         auto handler = std::make_shared<ClientHandler>(client_socket, client_addr, 
                                                        auth_service_ptr, signing_service_ptr, 
                                                        logger_ptr, log_location, active_clients);
@@ -94,6 +93,6 @@ void Server::acceptLoop() {
             handler->run();
         });
         
-        client_thread.detach(); // Позволяем потоку выполняться независимо (отсоединяем его)
+        client_thread.detach(); 
     }
 }

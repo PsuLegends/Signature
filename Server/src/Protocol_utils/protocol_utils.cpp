@@ -90,7 +90,7 @@ namespace ProtocolUtils
     }
     int send_formatted_message(int socket, const std::string &header, const std::string &client_id, int msg_id, const std::string &message)
     {
-        // 1. Формируем основной пакет
+        // 1. Формируем основной пакет с данными
         std::string data_packet = MessageProtocol::build(header, client_id, msg_id, message);
 
         // 2. Формируем пакет с его длиной
@@ -98,71 +98,101 @@ namespace ProtocolUtils
         std::string length_packet = MessageProtocol::build("LENGTH", "server", -1, length_str);
 
         // 3. Отправляем пакет с длиной
-        if (send_packet(socket, length_packet) != 0)
-        {
+        if (send_packet(socket, length_packet) != 0) {
             std::cerr << "[ERROR] [send_formatted_message] Failed to send LENGTH packet." << std::endl;
             return -1;
         }
 
-        // Небольшая технологическая пауза. В идеальном мире она не нужна,
-        // но на практике может помочь клиенту обработать пакеты по очереди.
-        // Если уберете, тщательно тестируйте.
-        //std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
-        // 4. Отправляем основной пакет
-        if (send_packet(socket, data_packet) != 0)
-        {
+        // 4. Отправляем основной пакет с данными
+        if (send_packet(socket, data_packet) != 0) {
             std::cerr << "[ERROR] [send_formatted_message] Failed to send DATA packet." << std::endl;
             return -1;
         }
 
         return 0;
     }
+    // --- НОВОЕ: Приватная вспомогательная функция для надежного чтения ---
+    namespace {
+        /**
+         * @brief Надежно читает ровно `bytes_to_receive` байт из сокета.
+         * Блокируется, пока все байты не будут получены.
+         * @return Строка с данными или пустая строка при ошибке/разрыве соединения.
+         */
+        std::string receive_exact_bytes(int socket, size_t bytes_to_receive) {
+            std::string result;
+            result.reserve(bytes_to_receive);
+            
+            size_t total_received = 0;
+            std::vector<char> buffer(bytes_to_receive > 4096 ? 4096 : bytes_to_receive);
 
-    std::string receive_formatted_message(int socket, size_t buffer_size)
+            while (total_received < bytes_to_receive) {
+                size_t to_read_now = bytes_to_receive - total_received;
+                if (to_read_now > buffer.size()) {
+                    to_read_now = buffer.size();
+                }
+
+                ssize_t bytes_this_call = recv(socket, buffer.data(), to_read_now, 0);
+
+                if (bytes_this_call <= 0) { // Ошибка или соединение закрыто
+                    if (bytes_this_call < 0) {
+                        perror("[ERROR] [receive_exact_bytes] recv() failed");
+                    }
+                    return ""; // Возвращаем пустую строку
+                }
+
+                result.append(buffer.data(), bytes_this_call);
+                total_received += bytes_this_call;
+            }
+            return result;
+        }
+    }
+
+    // --- ИЗМЕНЕНО: Полностью переписанная функция для надежного приема ---
+    std::optional<MessageProtocol::ParsedMessage> receive_and_parse_message(int socket, size_t buffer_size)
     {
         // 1. Принимаем первый пакет (ожидаем, что это пакет с длиной)
-        std::string length_packet_raw = receive_packet(socket, buffer_size);
-        if (length_packet_raw.empty())
-            return "";
+        // Здесь используем старый receive_packet, т.к. мы не знаем точный размер пакета с длиной,
+        // но мы знаем, что он короткий и придет целиком.
+        std::string length_packet_raw = ProtocolUtils::receive_packet(socket, buffer_size);
+        if (length_packet_raw.empty()) {
+            return std::nullopt; // Соединение закрыто
+        }
 
         // 2. Парсим его, чтобы узнать длину следующего пакета
         MessageProtocol::ParsedMessage parsed_length_msg;
-        try
-        {
+        try {
             parsed_length_msg = MessageProtocol::parse(length_packet_raw);
-        }
-        catch (...)
-        { /* ошибка парсинга */
-            return "";
-        }
-
-        if (parsed_length_msg.header != "LENGTH")
-        {
-            // Нарушение протокола
-            std::cerr << "[ERROR] [receive_formatted_message] Expected LENGTH packet, but got " << parsed_length_msg.header << std::endl;
-            return "";
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] [receive_and_parse_message] Failed to parse LENGTH packet: " << e.what() << std::endl;
+            return std::nullopt;
         }
 
-        // !!! Этот простой recv не гарантирует получение всех данных, если они большие.
-        // Здесь нужна более сложная логика чтения ровно `payload_size` байт.
-        // Пока для простоты оставляем так.
-        // 3. Принимаем второй, основной пакет
-        std::string data_packet_raw = receive_packet(socket, buffer_size);
-        if (data_packet_raw.empty())
-            return "";
-
-        // 4. Парсим его и возвращаем полезную нагрузку
-        MessageProtocol::ParsedMessage parsed_data_msg;
-        try
-        {
-            parsed_data_msg = MessageProtocol::parse(data_packet_raw);
-        }
-        catch (...)
-        { /* ошибка парсинга */
-            return "";
+        if (parsed_length_msg.header != "LENGTH") {
+            std::cerr << "[ERROR] [receive_and_parse_message] Expected LENGTH packet, but got " << parsed_length_msg.header << std::endl;
+            return std::nullopt;
         }
 
-        return parsed_data_msg.message;
+        // 3. Получаем размер основного пакета
+        size_t payload_size = 0;
+        try {
+            payload_size = std::stoul(parsed_length_msg.message);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] [receive_and_parse_message] Invalid payload size in LENGTH packet: " << e.what() << std::endl;
+            return std::nullopt;
+        }
+
+        // 4. Читаем из сокета ровно `payload_size` байт
+        std::string data_packet_raw = receive_exact_bytes(socket, payload_size);
+        if (data_packet_raw.empty()) {
+            return std::nullopt; // Соединение закрыто во время чтения основного пакета
+        }
+
+        // 5. Парсим основной пакет и возвращаем результат
+        try {
+            return MessageProtocol::parse(data_packet_raw);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] [receive_and_parse_message] Failed to parse DATA packet: " << e.what() << std::endl;
+            return std::nullopt;
+        }
     }
 } // namespace ProtocolUtils
