@@ -4,7 +4,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <thread>
-#include "client_handler.h" // Важно
+#include "../Client_handler/client_handler.h" // Важно
 
 Server::Server(uint16_t port, const std::string& log_path)
     : port(port), log_location(log_path)

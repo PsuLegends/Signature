@@ -58,7 +58,8 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 # Цель для очистки проекта
 clean:
 	@echo "Очистка проекта..."
-	@rm -rf $(BUILDДIR) $(TARGET)
+	@# ИСПРАВЛЕНО: BUILDDIR вместо BUILDДIR
+	@rm -rf $(BUILDDIR) $(TARGET)
 
 
 # === Вспомогательная цель для проверки библиотек ===
