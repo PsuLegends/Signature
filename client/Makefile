@@ -9,61 +9,47 @@ SRCDIR = src
 BUILDDIR = build
 
 # --- Флаги компиляции ---
-# -std=c++20            : Стандарт C++
-# -fPIC                 : Position-Independent Code
-# -Wall -Wextra         : Включаем максимум предупреждений для чистоты кода
-# -g                    : Добавляем отладочную информацию (рекомендуется во время разработки)
-# -O2                   : Умеренная оптимизация (O3 может быть слишком агрессивной)
-SANITIZE_FLAGS = -g -fsanitize=address
+# -g                    : Оставляем отладочные символы, это полезно даже в релизе
+# -O2                   : Стандартный флаг оптимизации для релизных сборок
+CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -g -O2
 
-# --- Флаги компиляции ---
-CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra $(SANITIZE_FLAGS)
-
-# --- Флаги линковки и Библиотеки ---
-# Клиенту НЕ НУЖНЫ: Qt, uWebSockets/uSockets, libuv, zlib, pthreads.
-# Клиенту НУЖНЫ:
-#   -lssl -lcrypto        : Для OpenSSL (используется в модуле Rsa)
-#   -lcryptopp            : Для Crypto++ (используется в Crypto_utils)
-#   -lboost_program_options : Для парсинга аргументов (используется в UI)
-#   -lboost_filesystem    : Для проверки пути к лог-файлу (используется в Logger)
-# LDFLAGS пуст, т.к. все стандартные пути.
+# --- Флаги линковки ---
+# Больше не нужны флаги для Sanitizer'а, LDFLAGS пуст
 LDFLAGS =
+
+# --- Библиотеки ---
+# Удалена библиотека -lasan, т.к. AddressSanitizer больше не используется
 LDLIBS  = -lssl -lcrypto -lcryptopp -lboost_program_options -lboost_filesystem
 
 
 # === Автоматическое обнаружение исходных файлов (без изменений) ===
-# Находим все .cpp файлы рекурсивно в директории src
 SOURCES := $(shell find $(SRCDIR) -name '*.cpp' -type f)
-
-# Создаем список объектных файлов, заменяя 'src/' на 'build/' и '.cpp' на '.o'
 OBJECTS := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SOURCES))
 
 
 # === Основные цели (без изменений в логике) ===
-
 .PHONY: all clean check_libs
 
-# Цель по умолчанию: сначала проверить библиотеки, затем собрать исполняемый файл
 all: check_libs $(TARGET)
 
-# Правило для линковки финального исполняемого файла
+# --- Правило линковки ---
+# Теперь оно снова простое. Для надежности передаем CXXFLAGS и сюда.
 $(TARGET): $(OBJECTS)
 	@echo "Линковка -> $@"
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
-# Правило для компиляции каждого .cpp файла в .o файл
+# Правило компиляции (без изменений)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "Компиляция -> $<"
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Цель для очистки проекта (без изменений)
+# --- Правило очистки ---
 clean:
 	@echo "Очистка проекта..."
-	@rm -rf $(BUILDDIR) $(TARGET)
+	@rm -rf $(BUILDDIR) $(TARGET) a.out
 
 
-# === Вспомогательная цель для проверки библиотек (полностью переписана под клиента) ===
 
 check_libs:
 	@echo "Проверка наличия необходимых библиотек для клиента..."

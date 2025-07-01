@@ -3,7 +3,7 @@
 // Подключаем наши утилитарные функции для RSA
 // Путь нужно будет скорректировать под вашу структуру.
 #include "../Rsa/rsa_crypto.h"
-
+#include <cstdlib>
 #include <iostream> // для вывода в консоль
 #include <vector>
 
@@ -12,29 +12,40 @@
  */
 SigningService::SigningService(const std::string& private_key_path,
                                const std::string& public_key_n_path,
-                               const std::string& public_key_e_path) 
+                               const std::string& public_key_e_path)
 {
-    // Обертываем загрузку ключей в блок try-catch,
-    // чтобы обработать ошибки и кинуть наше кастомное исключение.
     try {
-        std::cout << "[INFO] [SigningService] Загрузка ключей..." << std::endl;
-        
-        // Используем вспомогательную функцию из RSA-модуля для загрузки.
-        // Предполагается, что она кидает std::exception в случае ошибки.
+        std::cout << "[INFO] [SigningService] Проверка и загрузка ключей..." << std::endl;
         d_key = loadKeyFromFile(private_key_path);
         n_key = loadKeyFromFile(public_key_n_path);
         e_key = loadKeyFromFile(public_key_e_path);
-
         keys_are_loaded = true;
         std::cout << "[INFO] [SigningService] Ключи успешно загружены." << std::endl;
 
     } catch (const std::exception& e) {
-        std::cerr << "[CRITICAL] [SigningService] Не удалось загрузить ключи: " << e.what() << std::endl;
-        // Кидаем наше собственное, более специфичное исключение, которое
-        // может быть поймано на более высоком уровне (например, в классе Server).
-        throw SigningServiceError("Ошибка при инициализации сервиса подписи: " + std::string(e.what()));
+        std::cerr << "\n[WARN] [SigningService] Не удалось загрузить ключи. Причина: " << e.what() << std::endl;
+        
+        // *** ИСПРАВЛЕННЫЙ ПУТЬ ВЫЗОВА ***
+        const char* keygen_command = "./src/Signing/keygen";
+        
+        std::cout << " -> Попытка запустить внешнюю утилиту для генерации ключей '" << keygen_command << "'..." << std::endl;
+        
+        // system() будет искать файл по этому пути ОТНОСИТЕЛЬНО того места, где запущен сервер
+        int result = system(keygen_command);
+        
+        if (result == 0) { 
+            std::cout << "\n[INFO] [SigningService] Утилита генерации ключей успешно выполнена." << std::endl;
+        } else {
+            std::cerr << "\n[ERROR] [SigningService] Не удалось выполнить утилиту генерации ключей." << std::endl;
+            std::cerr << "         Убедитесь, что Makefile корректно собирает утилиту по пути 'src/Signing/keygen'." << std::endl;
+        }
+
+        // Бросаем исключение, чтобы сервер в любом случае завершил работу
+        throw SigningServiceError("Инициализация прервана. Ключи отсутствовали и/или были сгенерированы. Пожалуйста, перезапустите сервер.");
     }
 }
+
+
 
 /**
  * @brief Подписывает предоставленный хеш.

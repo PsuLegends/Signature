@@ -1,66 +1,82 @@
 # --- Имя компилятора ---
 CXX = g++
 
-# --- Имя целевого исполняемого файла ---
-TARGET = server
+# --- Имена целевых исполняемых файлов ---
+TARGET_SERVER = server
+# *** ИЗМЕНЕНИЕ: Полный и однозначный путь к бинарнику утилиты ***
+TARGET_KEYGEN = src/Signing/keygen
 
 # --- Директории ---
 SRCDIR = src
 BUILDDIR = build
 
-# === НОВЫЕ ФЛАГИ ДЛЯ ОТЛАДКИ ===
-# -g                    : Добавляем отладочные символы, что КРАЙНЕ ВАЖНО для ASan.
-# -fsanitize=address    : Включаем AddressSanitizer.
-# -fno-omit-frame-pointer: Рекомендуется для более качественных стектрейсов с ASan.
+# --- Флаги Sanitizer'а ---
 SANITIZE_FLAGS = -g -fsanitize=address -fno-omit-frame-pointer
 
-# --- Флаги компиляции ---
-# -std=c++20            : Стандарт C++
-# -fPIC                 : Position-Independent Code
-# -Wall -Wextra         : Максимум предупреждений
-# -O1                   : СНИЖАЕМ оптимизацию до -O1. ASan лучше всего работает
-#                         с низкой оптимизацией. Вернете -O3 после отладки.
-# $(shell ...)          : Получаем флаги от pkg-config
-CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -O1 $(SANITIZE_FLAGS) \
-           $(shell pkg-config --cflags Qt5Core Qt5Sql)
+# --- Флаги компиляции СЕРВЕРА ---
+CXXFLAGS_SERVER = -std=c++20 -fPIC -Wall -Wextra -O1 $(SANITIZE_FLAGS) \
+                  $(shell pkg-config --cflags Qt5Core Qt5Sql)
 
-# --- Флаги линковки ---
-# Добавляем SANITIZE_FLAGS сюда, чтобы линковщик подтянул библиотеку libasan.
-LDFLAGS = -Llib/uWebSockets/uSockets $(SANITIZE_FLAGS)
+# --- Флаги компиляции УТИЛИТЫ KEYGEN ---
+CXXFLAGS_KEYGEN = -std=c++20 -Wall -Wextra -g -O2
 
-# --- Библиотеки (LDLIBS) ---
-# Добавляем -lpthread явно, т.к. ваш сервер использует std::thread.
-LDLIBS  = -l:uSockets.a -lssl -lcrypto -luv -lz -lpthread -lcryptopp -lboost_program_options -lboost_filesystem \
-          $(shell pkg-config --libs Qt5Core Qt5Sql)
+# --- Библиотеки для СЕРВЕРА ---
+LDFLAGS_SERVER = -Llib/uWebSockets/uSockets $(SANITIZE_FLAGS)
+LDLIBS_SERVER  = -l:uSockets.a -lssl -lcrypto -luv -lz -lpthread -lcryptopp -lboost_program_options -lboost_filesystem \
+                 $(shell pkg-config --libs Qt5Core Qt5Sql)
 
-# === Автоматическое обнаружение исходных файлов (без изменений) ===
-SOURCES := $(shell find $(SRCDIR) -name '*.cpp' -type f)
-OBJECTS := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SOURCES))
+# --- Библиотеки для УТИЛИТЫ KEYGEN ---
+LDLIBS_KEYGEN  = -lssl -lcrypto
+
+# === Автоматическое обнаружение исходных файлов СЕРВЕРА ===
+# Исключаем keygen.cpp, как и раньше
+SOURCES_SERVER := $(shell find $(SRCDIR) -name '*.cpp' -type f -not -path "$(SRCDIR)/Keygen/keygen.cpp")
+OBJECTS_SERVER := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SOURCES_SERVER))
 
 
-# === Основные цели (без изменений в логике) ===
-
+# === Основные цели ===
 .PHONY: all clean check_libs
 
-all: check_libs $(TARGET)
+# Цель `all` зависит от полного пути к `keygen`
+all: $(TARGET_KEYGEN) check_libs $(TARGET_SERVER)
 
-# Правило для линковки (без изменений, т.к. флаги уже в LDFLAGS)
-$(TARGET): $(OBJECTS)
-	@echo "Линковка -> $@"
-	$(CXX) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+# --- Правила сборки для СЕРВЕРА ---
+$(TARGET_SERVER): $(OBJECTS_SERVER)
+	@echo "Линковка сервера -> $@"
+	$(CXX) $(CXXFLAGS_SERVER) $^ -o $@ $(LDLIBS_SERVER)
 
-# Правило для компиляции (без изменений, т.к. флаги уже в CXXFLAGS)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	@mkdir -p $(dir $@)
-	@echo "Компиляция -> $<"
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	@echo "Компиляция файла сервера -> $<"
+	$(CXX) $(CXXFLAGS_SERVER) -c $< -o $@
 
-# Цель для очистки (без изменений)
+
+# === ИСПРАВЛЕННЫЕ ПРАВИЛА СБОРКИ ДЛЯ KEYGEN ===
+KEYGEN_SRC = $(SRCDIR)/Keygen/keygen.cpp
+RSA_SRC = $(SRCDIR)/Rsa/rsa_crypto.cpp 
+RSA_OBJ = $(BUILDDIR)/Rsa/rsa_crypto.o_keygen
+
+# *** ГЛАВНОЕ ИЗМЕНЕНИЕ ***
+# Цель теперь - наш TARGET_KEYGEN (src/Signing/keygen)
+$(TARGET_KEYGEN): $(KEYGEN_SRC) $(RSA_OBJ)
+	@echo "Проверка/создание директории $(dir $@)..."
+	@mkdir -p $(dir $@)
+	@echo "Линковка утилиты keygen -> $@"
+	# Передаем исходники и объектник, а в -o подставляем имя цели ($@),
+	# которое теперь равно "src/Signing/keygen"
+	$(CXX) $(CXXFLAGS_KEYGEN) $(KEYGEN_SRC) $(RSA_OBJ) -o $@ $(LDLIBS_KEYGEN)
+
+# Правило для компиляции RSA-модуля для keygen (без изменений)
+$(RSA_OBJ): $(RSA_SRC)
+	@mkdir -p $(dir $@)
+	@echo "Компиляция RSA для keygen -> $<"
+	$(CXX) $(CXXFLAGS_KEYGEN) -c $< -o $@
+
+# --- Общие цели ---
 clean:
 	@echo "Очистка проекта..."
-	@rm -rf $(BUILDDIR) $(TARGET)
-
-
+	# Удаляем build, оба бинарника и временный объектник
+	@rm -rf $(BUILDDIR) $(TARGET_SERVER) $(TARGET_KEYGEN) $(RSA_OBJ)
 # Эта часть остается без изменений, она отличная.
 check_libs:
 	@echo "Проверка наличия необходимых библиотек..."
