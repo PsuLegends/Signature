@@ -14,7 +14,10 @@ BUILDDIR = build
 # -Wall -Wextra         : Включаем максимум предупреждений для чистоты кода
 # -g                    : Добавляем отладочную информацию (рекомендуется во время разработки)
 # -O2                   : Умеренная оптимизация (O3 может быть слишком агрессивной)
-CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -g -O2
+SANITIZE_FLAGS = -g -fsanitize=address
+
+# --- Флаги компиляции ---
+CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra $(SANITIZE_FLAGS)
 
 # --- Флаги линковки и Библиотеки ---
 # Клиенту НЕ НУЖНЫ: Qt, uWebSockets/uSockets, libuv, zlib, pthreads.
@@ -46,7 +49,7 @@ all: check_libs $(TARGET)
 # Правило для линковки финального исполняемого файла
 $(TARGET): $(OBJECTS)
 	@echo "Линковка -> $@"
-	$(CXX) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
 # Правило для компиляции каждого .cpp файла в .o файл
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
