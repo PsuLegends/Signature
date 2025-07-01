@@ -1,3 +1,4 @@
+// Файл: Client_handler/client_handler.h
 #pragma once
 
 #include <string>
@@ -20,6 +21,10 @@ private:
 };
 
 
+/**
+ * @class ClientHandler
+ * @brief Обрабатывает одно клиентское соединение в выделенном потоке.
+ */
 class ClientHandler {
 public:
     ClientHandler(int socket, sockaddr_in addr,
@@ -33,13 +38,20 @@ public:
     void run();
 
 private:
-    // Основная логика обработки
+    // --- Приватные методы ---
     void processRequests();
-    std::string receive_buffer;
-    // Методы для обработки конкретных операций
     void handleSignOperation();
     void handleGetPublicKeyOperation();
-    std::string receive_one_message();
+
+    /**
+     * @brief Централизованно отправляет сообщение об ошибке клиенту и логирует ее.
+     * @param errorHeader Заголовок сообщения об ошибке (напр., "AUTH_FAIL", "PROTO_ERROR").
+     * @param clientMessage Сообщение, которое увидит пользователь клиента.
+     * @param logMessage Детальное сообщение для лог-файла сервера.
+     */
+    void sendErrorAndLog(const std::string& errorHeader, const std::string& clientMessage, const std::string& logMessage);
+
+    // --- Поля класса ---
     int socket_fd;
     std::string client_ip_str;
     std::string client_id_str;

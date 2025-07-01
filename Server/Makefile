@@ -8,61 +8,58 @@ TARGET = server
 SRCDIR = src
 BUILDDIR = build
 
+# === НОВЫЕ ФЛАГИ ДЛЯ ОТЛАДКИ ===
+# -g                    : Добавляем отладочные символы, что КРАЙНЕ ВАЖНО для ASan.
+# -fsanitize=address    : Включаем AddressSanitizer.
+# -fno-omit-frame-pointer: Рекомендуется для более качественных стектрейсов с ASan.
+SANITIZE_FLAGS = -g -fsanitize=address -fno-omit-frame-pointer
+
 # --- Флаги компиляции ---
 # -std=c++20            : Стандарт C++
-# -fPIC                 : Position-Independent Code (хорошая практика для библиотек)
-# -Wall -Wextra         : Включаем максимум предупреждений для чистоты кода
-# -O3                   : Максимальная оптимизация
+# -fPIC                 : Position-Independent Code
+# -Wall -Wextra         : Максимум предупреждений
+# -O1                   : СНИЖАЕМ оптимизацию до -O1. ASan лучше всего работает
+#                         с низкой оптимизацией. Вернете -O3 после отладки.
 # $(shell ...)          : Получаем флаги от pkg-config
-CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -O3 \
+CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -O1 $(SANITIZE_FLAGS) \
            $(shell pkg-config --cflags Qt5Core Qt5Sql)
 
 # --- Флаги линковки ---
-# -L...                 : Пути к библиотекам
-# -l...                 : Имена библиотек
-LDFLAGS = -Llib/uWebSockets/uSockets
+# Добавляем SANITIZE_FLAGS сюда, чтобы линковщик подтянул библиотеку libasan.
+LDFLAGS = -Llib/uWebSockets/uSockets $(SANITIZE_FLAGS)
+
+# --- Библиотеки (LDLIBS) ---
+# Добавляем -lpthread явно, т.к. ваш сервер использует std::thread.
 LDLIBS  = -l:uSockets.a -lssl -lcrypto -luv -lz -lpthread -lcryptopp -lboost_program_options -lboost_filesystem \
           $(shell pkg-config --libs Qt5Core Qt5Sql)
 
-# === Автоматическое обнаружение исходных файлов ===
-# Находим все .cpp файлы рекурсивно в директории src
+# === Автоматическое обнаружение исходных файлов (без изменений) ===
 SOURCES := $(shell find $(SRCDIR) -name '*.cpp' -type f)
-
-# Создаем список объектных файлов, заменяя 'src/' на 'build/' и '.cpp' на '.o'
 OBJECTS := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SOURCES))
 
 
-# === Основные цели ===
+# === Основные цели (без изменений в логике) ===
 
-# .PHONY указывает, что 'all' и 'clean' - это не файлы
 .PHONY: all clean check_libs
 
-# Цель по умолчанию: сначала проверить библиотеки, затем собрать исполняемый файл
 all: check_libs $(TARGET)
 
-# Правило для линковки финального исполняемого файла
-# $@ - имя цели (т.е. $(TARGET))
-# $^ - все зависимости (т.е. $(OBJECTS))
+# Правило для линковки (без изменений, т.к. флаги уже в LDFLAGS)
 $(TARGET): $(OBJECTS)
 	@echo "Линковка -> $@"
 	$(CXX) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
-# Правило для компиляции каждого .cpp файла в .o файл
-# $< - первая зависимость (т.е. один из .cpp файлов)
+# Правило для компиляции (без изменений, т.к. флаги уже в CXXFLAGS)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
-	@# Создаем поддиректорию в build/, если она еще не существует
 	@mkdir -p $(dir $@)
 	@echo "Компиляция -> $<"
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Цель для очистки проекта
+# Цель для очистки (без изменений)
 clean:
 	@echo "Очистка проекта..."
-	@# ИСПРАВЛЕНО: BUILDDIR вместо BUILDДIR
 	@rm -rf $(BUILDDIR) $(TARGET)
 
-
-# === Вспомогательная цель для проверки библиотек ===
 
 # Эта часть остается без изменений, она отличная.
 check_libs:

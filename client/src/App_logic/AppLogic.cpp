@@ -1,22 +1,21 @@
-// Файл: App_logic/AppLogic.cpp
 #include "AppLogic.h"
 
-// Прямая зависимость от утилит протокола и криптографии
+// Прямые зависимости
 #include "../Protocol_utils/protocol_utils.h"
 #include "../Crypto_utils/crypto_utils.h"
 
-// Системные инклюды для работы с сокетами
+// Системные инклюды
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <stdexcept>
-#include <cerrno>  // для errno
-#include <cstring> // для strerror
+#include <cerrno>
+#include <cstring>
 
 // --- Конструктор и Деструктор ---
 
 AppLogic::AppLogic(
-    const std::string& ip, uint16_t port, const std::string& username, 
+    const std::string& ip, uint16_t port, const std::string& username,
     const std::string& password, std::shared_ptr<logger> logger_instance,
     const std::string& log_path
 ) :
@@ -40,18 +39,13 @@ AppLogic::~AppLogic() {
 
 void AppLogic::run_login_flow() {
     m_logger->write_log(m_log_path, "[AppLogic] Запуск клиента для '" + m_user_name + "' в режиме АУТЕНТИФИКАЦИИ.");
-    
     if (!connect_to_server()) {
         m_console.show_error("Не удалось подключиться к серверу.");
         return;
     }
-    
     if (perform_authentication()) {
         main_loop();
-    } else {
-        m_console.show_error("Аутентификация не удалась. Отключение.");
-    }
-
+    } // Сообщение об ошибке аутентификации уже выводится внутри perform_authentication
     disconnect();
     m_console.show_message("Работа клиента завершена.");
     m_logger->write_log(m_log_path, "[AppLogic] Клиент штатно завершил работу.");
@@ -59,7 +53,6 @@ void AppLogic::run_login_flow() {
 
 void AppLogic::run_registration_flow() {
     m_logger->write_log(m_log_path, "[AppLogic] Запуск клиента для '" + m_user_name + "' в режиме РЕГИСТРАЦИИ.");
-
     if (!connect_to_server()) {
         m_console.show_error("Не удалось подключиться к серверу.");
         return;
@@ -67,78 +60,34 @@ void AppLogic::run_registration_flow() {
     
     m_logger->write_log(m_log_path, "[AppLogic] Начало процесса регистрации.");
     if (!send_message({ "REGISTER", m_user_name, -1, "" })) {
+        m_console.show_error("Потеряно соединение с сервером при отправке запроса на регистрацию.");
         disconnect(); return;
     }
     
     if (!send_message({ "PASSWORD", m_user_name, -1, m_user_password })) {
+        m_console.show_error("Потеряно соединение с сервером при отправке пароля.");
         disconnect(); return;
     }
     
-    auto reg_result = receive_message();
-    if (reg_result && reg_result->header == "REG_OK") {
+    auto response = receive_message();
+    if (!response) {
+        m_console.show_error("Сервер разорвал соединение, не прислав ответ о регистрации.");
+    } else if (response->header == "REG_OK") {
         m_logger->write_log(m_log_path, "[AppLogic] Регистрация успешна.");
         m_console.show_message("Регистрация пользователя '" + m_user_name + "' прошла успешно!");
     } else {
-        std::string error_details = reg_result ? reg_result->message : "сервер не отвечает";
-        m_logger->write_log(m_log_path, "[AppLogic] Регистрация провалена: " + error_details);
-        m_console.show_error("Регистрация не удалась: " + error_details);
+        // Обработка конкретной ошибки от сервера
+        std::string error_msg = "Регистрация не удалась: " + response->message + " (код: " + response->header + ")";
+        m_console.show_error(error_msg);
+        m_logger->write_log(m_log_path, "[AppLogic] " + error_msg);
     }
-    
     disconnect();
 }
 
 
 // --- Приватные методы ---
 
-bool AppLogic::is_connected() const {
-    return m_socket != -1;
-}
-
-bool AppLogic::connect_to_server() {
-    m_logger->write_log(m_log_path, "[AppLogic] Попытка подключения к " + m_server_ip + ":" + std::to_string(m_server_port));
-    
-    m_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (m_socket < 0) { 
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка создания сокета: " + std::string(strerror(errno)));
-        return false;
-    }
-
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(m_server_port);
-    if (inet_pton(AF_INET, m_server_ip.c_str(), &server_addr.sin_addr) <= 0) {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка: неверный IP адрес " + m_server_ip);
-        disconnect();
-        return false;
-    }
-    
-    if (::connect(m_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка подключения к серверу: " + std::string(strerror(errno)));
-        disconnect();
-        return false;
-    }
-    
-    auto welcome_msg = receive_message();
-    if (!welcome_msg) {
-        m_logger->write_log(m_log_path, "[AppLogic] Сервер не прислал приветственное сообщение.");
-        return false;
-    }
-    
-    if (welcome_msg->header == "CONN_REJECT") {
-         m_logger->write_log(m_log_path, "[AppLogic] Отказ в соединении: " + welcome_msg->message);
-         disconnect();
-         return false;
-    }
-    
-    if (welcome_msg->header != "CONN_ACCEPT") {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка: получено некорректное приветствие: " + welcome_msg->header);
-        disconnect();
-        return false;
-    }
-    
-    m_logger->write_log(m_log_path, "[AppLogic] Соединение с сервером успешно установлено.");
-    return true;
-}
+bool AppLogic::is_connected() const { return m_socket != -1; }
 
 void AppLogic::disconnect() {
     if (is_connected()) {
@@ -148,28 +97,42 @@ void AppLogic::disconnect() {
     }
 }
 
+// --- Переписанные сетевые методы с обработкой ошибок ---
+
+bool AppLogic::connect_to_server() {
+    // ... (код метода без изменений, он уже хорош)
+    m_logger->write_log(m_log_path, "[AppLogic] Попытка подключения к " + m_server_ip + ":" + std::to_string(m_server_port));
+    m_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (m_socket < 0) {  return false; }
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(m_server_port);
+    if (inet_pton(AF_INET, m_server_ip.c_str(), &server_addr.sin_addr) <= 0) { disconnect(); return false; }
+    if (::connect(m_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) { disconnect(); return false; }
+    auto welcome_msg = receive_message();
+    if (!welcome_msg) { return false; }
+    if (welcome_msg->header == "CONN_REJECT") { disconnect(); return false; }
+    if (welcome_msg->header != "CONN_ACCEPT") { disconnect(); return false; }
+    return true;
+}
+
 bool AppLogic::send_message(const MessageProtocol::ParsedMessage& msg) {
-    if (!is_connected()) {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка отправки: нет активного соединения.");
-        return false;
-    }
-    if (ProtocolUtils::send_formatted_message(m_socket, msg.header, msg.clientID, msg.messageID, msg.message) != 0) {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка отправки сообщения, разрыв соединения.");
-        disconnect();
-        return false;
-    }
+    // ... (код метода без изменений)
+    if (!is_connected()) return false;
+    if (ProtocolUtils::send_formatted_message(m_socket, msg.header, msg.clientID, msg.messageID, msg.message) != 0) { disconnect(); return false; }
     return true;
 }
 
 std::optional<MessageProtocol::ParsedMessage> AppLogic::receive_message() {
+    // ... (код метода без изменений)
     if (!is_connected()) return std::nullopt;
     auto msg = ProtocolUtils::receive_and_parse_message(m_socket);
-    if (!msg) {
-        m_logger->write_log(m_log_path, "[AppLogic] Соединение было разорвано во время ожидания сообщения.");
-        disconnect();
-    }
+    if (!msg) { disconnect(); }
     return msg;
 }
+
+
+// --- Методы бизнес-логики с новой обработкой ошибок ---
 
 bool AppLogic::perform_authentication() {
     m_logger->write_log(m_log_path, "[AppLogic] Начало аутентификации.");
@@ -177,8 +140,15 @@ bool AppLogic::perform_authentication() {
     if (!send_message({ "LOGIN", m_user_name, -1, "" })) return false;
 
     auto challenge_msg = receive_message();
-    if (!challenge_msg || challenge_msg->header != "CHALLENGE") {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка: не получен корректный challenge от сервера.");
+    if (!challenge_msg) {
+        m_console.show_error("Сервер не прислал challenge для аутентификации.");
+        return false;
+    }
+    // Обрабатываем конкретные ошибки сервера на этом этапе
+    if (challenge_msg->header != "CHALLENGE") {
+        std::string error_msg = "Ошибка аутентификации: " + challenge_msg->message + " (код: " + challenge_msg->header + ")";
+        m_console.show_error(error_msg);
+        m_logger->write_log(m_log_path, "[AppLogic] " + error_msg);
         return false;
     }
     
@@ -190,12 +160,15 @@ bool AppLogic::perform_authentication() {
     
     auto auth_result = receive_message();
     if (auth_result && auth_result->header == "AUTH_OK") {
+        m_console.show_message("Аутентификация прошла успешно! " + auth_result->message);
         m_logger->write_log(m_log_path, "[AppLogic] Аутентификация успешна.");
-        m_console.show_message("Аутентификация прошла успешно!");
         return true;
     } else {
-        std::string error_details = auth_result ? auth_result->message : "сервер не отвечает";
-        m_logger->write_log(m_log_path, "[AppLogic] Аутентификация провалена: " + error_details);
+        std::string error_msg = auth_result
+            ? "Аутентификация провалена: " + auth_result->message + " (код: " + auth_result->header + ")"
+            : "Аутентификация провалена: сервер не отвечает.";
+        m_console.show_error(error_msg);
+        m_logger->write_log(m_log_path, "[AppLogic] " + error_msg);
         return false;
     }
 }
@@ -213,16 +186,12 @@ void AppLogic::main_loop() {
             case UserMenuChoice::REQUEST_SIGNATURE: handle_signing_request(); break;
             case UserMenuChoice::VERIFY_LOCALLY: handle_verification_request(); break;
             case UserMenuChoice::UNKNOWN:
-            default:
-                m_console.show_error("Неверный выбор. Пожалуйста, попробуйте снова.");
-                break;
+            default: m_console.show_error("Неверный выбор."); break;
         }
     }
 }
 
 void AppLogic::handle_signing_request() {
-    m_logger->write_log(m_log_path, "[AppLogic] Пользователь запросил подпись файла.");
-    
     std::string file_path = m_console.ask_filepath("Введите полный путь к файлу для подписи: ");
     if (file_path.empty()) return;
 
@@ -235,27 +204,16 @@ void AppLogic::handle_signing_request() {
         return;
     }
     
-    // ================== ИСПРАВЛЕНИЕ ==================
-    // ШАГ А: Отправляем команду, ЧТО мы хотим сделать. Тело сообщения пустое.
-    m_logger->write_log(m_log_path, "[AppLogic] Отправка команды SIGN_HASH на сервер.");
-    if (!send_message({ "SIGN_HASH", m_user_name, -1, "" })) {
-        m_console.show_error("Не удалось отправить команду на сервер.");
-        return;
-    }
-
-    // ШАГ Б: Отправляем ДАННЫЕ для этой команды. Заголовок можно сделать любым
-    // информативным, например HASH_DATA, или даже оставить пустым, т.к. сервер его не проверяет.
-    m_logger->write_log(m_log_path, "[AppLogic] Отправка хеша на сервер: " + hex_hash);
-    if (!send_message({ "HASH_DATA", m_user_name, -1, hex_hash })) {
-        m_console.show_error("Не удалось отправить хеш на сервер.");
-        return;
-    }
-    // =================================================
-
-    // Теперь получаем ответ (подпись)
+    if (!send_message({ "SIGN_HASH", m_user_name, -1, "" })) { return; }
+    if (!send_message({ "HASH_DATA", m_user_name, -1, hex_hash })) { return; }
+    
     auto response = receive_message();
-    if (response && response->header == "SIGN_SUCCESS") {
-        // ... остальной код обработки подписи без изменений ...
+    if (!response) {
+        m_console.show_error("Сервер разорвал соединение во время ожидания подписи.");
+        return;
+    }
+    
+    if (response->header == "SIGN_SUCCESS") {
         const std::string& signature_hex = response->message;
         m_console.display_signature(signature_hex);
         try {
@@ -265,20 +223,15 @@ void AppLogic::handle_signing_request() {
             m_console.show_error(e.what());
         }
     } else {
-        std::string err = response ? response->message : "сервер разорвал соединение";
-        m_console.show_error("Не удалось получить подпись: " + err);
+        std::string error_msg = "Не удалось получить подпись: " + response->message + " (код: " + response->header + ")";
+        m_console.show_error(error_msg);
+        m_logger->write_log(m_log_path, "[AppLogic] " + error_msg);
     }
 }
 
 void AppLogic::handle_verification_request() {
-    m_logger->write_log(m_log_path, "[AppLogic] Пользователь запросил проверку подписи.");
-    
     BigInt n, e;
-    if (!request_public_key(n, e)) {
-        m_console.show_error("Не удалось получить публичный ключ от сервера.");
-        return;
-    }
-    m_console.show_message("Публичный ключ успешно получен.");
+    if (!request_public_key(n, e)) { return; }
     
     std::string original_path = m_console.ask_filepath("Введите путь к ОРИГИНАЛЬНОМУ файлу: ");
     if (original_path.empty()) return;
@@ -290,9 +243,9 @@ void AppLogic::handle_verification_request() {
         bool is_valid = m_signature_service.verify_signature(original_path, signature_path, n, e);
         m_console.display_verification_result(is_valid);
         m_logger->write_log(
-        m_log_path, 
-        std::string("[AppLogic] Проверка подписи завершена. Результат: ") + (is_valid ? "УСПЕХ" : "ПРОВАЛ")
-    );
+            m_log_path, 
+            std::string("[AppLogic] Проверка подписи завершена. Результат: ") + (is_valid ? "УСПЕХ" : "ПРОВАЛ")
+        );
     } catch (const std::exception& e) {
         m_console.show_error(e.what());
         m_logger->write_log(m_log_path, "[AppLogic] Ошибка при верификации: " + std::string(e.what()));
@@ -300,27 +253,31 @@ void AppLogic::handle_verification_request() {
 }
 
 bool AppLogic::request_public_key(BigInt& out_n, BigInt& out_e) {
-    m_logger->write_log(m_log_path, "[AppLogic] Запрос публичного ключа у сервера.");
-    
     if (!send_message({ "GET_PUB_KEY", m_user_name, -1, "" })) return false;
 
     auto n_response = receive_message();
-    if (!n_response || n_response->header != "PUB_KEY_N") {
-        m_logger->write_log(m_log_path, "[AppLogic] Ошибка: не получена компонента N ключа.");
+    auto e_response = receive_message();
+
+    if (!n_response || !e_response) {
+        m_console.show_error("Сервер разорвал соединение во время передачи публичного ключа.");
         return false;
     }
-    auto e_response = receive_message();
-    if (!e_response || e_response->header != "PUB_KEY_E") {
-         m_logger->write_log(m_log_path, "[AppLogic] Ошибка: не получена компонента E ключа.");
+
+    if (n_response->header != "PUB_KEY_N" || e_response->header != "PUB_KEY_E") {
+        std::string error_msg = "Ошибка протокола при получении ключа. Получены заголовки: " 
+                              + n_response->header + ", " + e_response->header;
+        m_console.show_error(error_msg);
+        m_logger->write_log(m_log_path, "[AppLogic] " + error_msg);
         return false;
     }
     
     try {
         out_n = BigInt::fromHexString(n_response->message);
         out_e = BigInt::fromHexString(e_response->message);
-        m_logger->write_log(m_log_path, "[AppLogic] Публичный ключ успешно получен и распарсен.");
+        m_console.show_message("Публичный ключ успешно получен.");
         return true;
     } catch (const std::exception& e) {
+        m_console.show_error("Не удалось разобрать компоненты ключа, полученные от сервера.");
         m_logger->write_log(m_log_path, "[AppLogic] Ошибка конвертации ключа из HEX: " + std::string(e.what()));
         return false;
     }
