@@ -52,7 +52,7 @@ bool AuthService::authenticateClient(int socket, const std::string& client_id) {
     }
 
     // 4. Получаем "Ответ" от клиента
-    auto response_opt = ProtocolUtils::receive_and_parse_message(socket, 1024);
+    auto response_opt = ProtocolUtils::receive_and_parse_message(socket);
     if (!response_opt) {
         logger_ref.write_log(log_location, log_prefix + "Failure - Client disconnected before sending response.");
         removeChallenge(socket);
@@ -120,7 +120,7 @@ bool AuthService::registerClient(int socket, const std::string& client_id, const
     }
 
     // 2. Получаем пароль от клиента
-    auto password_msg_opt = ProtocolUtils::receive_and_parse_message(socket, 1024);
+    auto password_msg_opt = ProtocolUtils::receive_and_parse_message(socket);
     if (!password_msg_opt) {
         logger_ref.write_log(log_location, log_prefix + "Failure - Client disconnected before sending password.");
         return false;
