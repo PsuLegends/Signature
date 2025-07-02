@@ -1,15 +1,13 @@
-// Файл: Server/server.h
 #pragma once
 
 #include <string>
 #include <atomic>
 #include <memory>
-#include <vector>     // Для хранения потоков
-#include <thread>     // Для std::thread
-#include <mutex>      // Для защиты вектора потоков
+#include <vector>    
+#include <thread>     
+#include <mutex>     
 #include <netinet/in.h>
 
-// Зависимости от сервисов
 #include "../Logger/logger.h"
 #include "../Base/database.h"
 #include "../Auth_reg/auth_service.h"

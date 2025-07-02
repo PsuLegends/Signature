@@ -17,13 +17,11 @@ MessageProtocol::ParsedMessage MessageProtocol::parse(const std::string& raw) {
     size_t pos = 0;
     size_t next = raw.find('|');
 
-    // Header
     if (next == std::string::npos)
-        return result; // bad format
+        return result;
     result.header = raw.substr(0, next);
     pos = next + 1;
 
-    // Fields
     while ((next = raw.find('|', pos)) != std::string::npos) {
         std::string part = raw.substr(pos, next - pos);
         if (part.rfind("clientID:", 0) == 0) {
@@ -38,7 +36,6 @@ MessageProtocol::ParsedMessage MessageProtocol::parse(const std::string& raw) {
         pos = next + 1;
     }
 
-    // Last part (message)
     std::string last = raw.substr(pos);
     if (last.rfind("message:", 0) == 0) {
         result.message = last.substr(8);

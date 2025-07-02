@@ -1,10 +1,10 @@
 #pragma once
 #include <string>
 enum class UserMenuChoice {
-    REQUEST_SIGNATURE, // Запросить подпись для файла
-    VERIFY_LOCALLY,    // Проверить подпись локально
-    EXIT,              // Выход из приложения
-    UNKNOWN            // Неверный ввод
+    REQUEST_SIGNATURE,
+    VERIFY_LOCALLY,    
+    EXIT,            
+    UNKNOWN           
 };
 
 class InteractiveConsole {
